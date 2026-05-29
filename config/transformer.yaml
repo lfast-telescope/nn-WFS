@@ -1,0 +1,32 @@
+model:
+  type: transformer
+  img_size: 256
+  patch_size: 16          # 256 tokens per stream; use 32 for faster ablations (64 tokens)
+  embed_dim: 256
+  n_enc_blocks: 4
+  n_cross_blocks: 2
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  n_outputs: 14
+
+data:
+  hdf5_path: null         # override on the command line: --hdf5_path /path/to/data.h5
+  split_ratios: [0.80, 0.10, 0.10]
+  split_seed: 42
+  batch_size: 128
+  num_workers: 4
+  augment: true           # apply D4Augment during training
+
+training:
+  epochs: 50
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+  warmup_steps: 500       # linear LR warmup, then cosine decay
+  grad_clip: 1.0
+  amp: true               # torch.cuda.amp mixed precision
+
+logging:
+  checkpoint_dir: checkpoints/transformer
+  log_interval: 100       # log metrics every N batches
+  save_top_k: 3           # keep the best k checkpoints by val WFE rms

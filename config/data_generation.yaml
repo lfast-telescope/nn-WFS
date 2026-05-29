@@ -1,0 +1,107 @@
+# ──────────────────────────────────────────────────────────────────────
+# CWFS Training Data Generation Configuration
+# ──────────────────────────────────────────────────────────────────────
+
+optics:
+  OD: 0.76               # outer aperture diameter, metres
+  ID: 0.152              # inner aperture diameter (central obscuration), metres
+  focal_ratio: 3.33      # f-number (focal length = OD * focal_ratio)
+
+  # Defocus: physical axial offset of each camera from nominal focus.
+  # Sign convention: I1 = intra-focal (+delta_z), I2 = extra-focal (-delta_z).
+  # delta_z drives c4 = delta_z / (16 * focal_ratio^2 * sqrt(3))  [metres OPD]
+  # WARNING: confirm against LFAST optical design before full-scale generation.
+  delta_z: 1.4e-3        # axial defocus distance per camera, metres
+
+  # Focal plane sampling.
+  # q   : pixels per lambda/D at the reference wavelength.
+  #       Must satisfy q >= 2 (Nyquist); q=4 is the practical minimum for
+  #       defocused PSFs; q=8 is conservative. q need not be an integer.
+  # num_airy : half-width of focal grid in lambda/D units. The defocused PSF
+  #            blur radius ~ delta_z / (8*(f/#)^2 * lambda/D) in lambda/D.
+  #            Set large enough that < 1% of broadband flux is clipped at
+  #            the longest wavelength.  Verify empirically with check_grid_extent.
+  q: 4
+  num_airy: 24
+
+  # Pupil grid resolution (samples across diameter).
+  pupil_samples: 256
+
+  # Reference wavelength used to anchor the lambda/D grid and as the
+  # base wavelength for atmospheric OPD extraction.
+  wavelength_ref: 550.0e-9   # metres
+
+wavelengths:
+  # Polychromatic bandpass.
+  # Sampling is uniform in wavenumber (1/lambda) to give equal photon-energy spacing.
+  lambda_min: 400.0e-9   # metres
+  lambda_max: 700.0e-9   # metres
+  n_wavelengths: 35
+
+  # Spectral weights applied when summing monochromatic PSFs.
+  # 'flat'  : uniform weights (equal energy per wavenumber interval)
+  # 'solar' : approximate G-star spectrum  (not yet implemented, falls back to flat)
+  weights: flat
+
+zernike:
+  # Number of Zernike modes in the mirror phase screen (Noll ordering).
+  # Modes Z2..Z(2+n_modes-1) are used.  n_modes=14 covers Z2–Z15.
+  # Must match the n_outputs in the model configs (currently 14).
+  n_modes: 14
+
+  # RMS amplitude of each drawn coefficient, metres OPD.
+  # Can be a scalar (same for all modes) or a list of length n_modes.
+  # 100 nm ≈ typical residual mirror error in the relevant Zernike band.
+  amplitude_rms: 100.0e-9
+
+  # Coefficient sampling distribution: 'gaussian' or 'uniform'
+  distribution: gaussian
+
+  # Optional per-mode RMS override list (length must equal n_modes).
+  # If null, amplitude_rms scalar is used for all modes.
+  per_mode_rms_nm: null
+  # Example override:
+  # per_mode_rms_nm: [200, 200, 80, 80, 80, 60, 60, 60, 60, 50, 50, 50, 50, 50]
+
+atmosphere:
+  enabled: false
+
+  # Use hcipy's Las Campanas (LCO) multi-layer turbulence profile.
+  # If false, a single-layer Kolmogorov screen is used instead.
+  use_las_campanas: true
+
+  # Fried parameter at 500 nm (metres). Typical values:
+  #   good seeing:    r0 = 0.20 m   (1 arcsec at 500 nm)
+  #   median seeing:  r0 = 0.12 m   (1.7 arcsec)
+  #   poor seeing:    r0 = 0.06 m   (3.4 arcsec)
+  r0_500nm: 0.12
+  L0: 25.0               # outer scale for Las Campanas profile, metres
+
+  # Single-layer fallback (used only when use_las_campanas: false)
+  single_layer:
+    Cn2: 1.0e-14
+    L0: 25.0             # outer scale, metres
+    wind_speed: 10.0     # m/s
+    wind_direction: 0.0  # radians
+
+simulation:
+  n_examples: 1000       # unique Zernike mirror states
+  n_atm_seeds: 1         # independent atmosphere seeds per mirror state
+                         # total rows in HDF5 = n_examples * n_atm_seeds
+  t_frames: 32           # frames per mean-pooled image pair
+  frame_rate: 50.0       # Hz
+
+  # Final PSF image size written to HDF5 [img_size x img_size].
+  # Centre-crop (or zero-pad) from the propagated grid to this size.
+  img_size: 256
+
+  # HDF5 chunk shape along the N axis (affects read performance).
+  hdf5_chunk_size: 64
+
+  random_seed: 42
+
+output:
+  path: data/cwfs_synthetic.h5
+  # Unit metadata stored as HDF5 attribute on the 'labels' dataset.
+  # The training pipeline asserts this value on open.
+  label_units: metres_opd

@@ -1,0 +1,30 @@
+model:
+  type: cnn
+  base_ch: 32             # stem channels; stages scale to 32×2=64→128→256→256
+  stage_blocks: 2         # BasicBlocks per ResNet stage
+  n_cross_blocks: 2
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  n_outputs: 14
+
+data:
+  hdf5_path: null         # override on the command line: --hdf5_path /path/to/data.h5
+  split_ratios: [0.80, 0.10, 0.10]
+  split_seed: 42
+  batch_size: 256         # larger batch affordable; CNN is ~1.7× faster per sample
+  num_workers: 4
+  augment: true
+
+training:
+  epochs: 50
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+  warmup_steps: 500
+  grad_clip: 1.0
+  amp: true
+
+logging:
+  checkpoint_dir: checkpoints/cnn
+  log_interval: 100
+  save_top_k: 3
