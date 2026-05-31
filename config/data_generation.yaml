@@ -40,9 +40,9 @@ optics:
 wavelengths:
   # Polychromatic bandpass.
   # Sampling is uniform in wavenumber (1/lambda) to give equal photon-energy spacing.
-  lambda_min: 400.0e-9   # metres
+  lambda_min: 380.0e-9   # metres
   lambda_max: 700.0e-9   # metres
-  n_wavelengths: 5
+  n_wavelengths: 11
 
   # Spectral weights applied when summing monochromatic PSFs.
   # 'flat'  : uniform weights (equal energy per wavenumber interval)
@@ -99,8 +99,8 @@ atmosphere:
     wind_direction: 0.0  # radians
 
 simulation:
-  n_examples: 2       # unique Zernike mirror states
-  t_frames: 4           # frames per sequence pair
+  n_examples: 32       # unique Zernike mirror states
+  t_frames: 32           # frames per sequence pair
   frame_rate: 50.0       # Hz
 
   # Final PSF image size written to HDF5 [img_size x img_size].

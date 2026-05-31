@@ -1,3 +1,4 @@
+#%%
 """
 make_training_data.py — Synthetic CWFS Training Data Generator
 
@@ -35,13 +36,13 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-
+from datetime import datetime
 import h5py
 import numpy as np
 import yaml
 from scipy.ndimage import zoom
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -80,7 +81,7 @@ except ImportError:
             yield x
         print()
 
-
+#%%
 # ──────────────────────────────────────────────────────────────────────────────
 # Config loading
 # ──────────────────────────────────────────────────────────────────────────────
@@ -437,7 +438,7 @@ def propagate_polychromatic(
 
     return binned_frames
 
-
+#%%
 # ──────────────────────────────────────────────────────────────────────────────
 # Main generation loop
 # ──────────────────────────────────────────────────────────────────────────────
@@ -446,13 +447,21 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
     """
     Generate the full synthetic dataset and write to HDF5.
     """
-    out_path    = Path(output_path or cfg.output.path)
     n_examples  = cfg.simulation.n_examples
     n_total     = n_examples
+    t_frames    = cfg.simulation.t_frames
     img_size    = cfg.simulation.img_size
     n_modes     = cfg.zernike.n_modes
     chunk       = cfg.simulation.hdf5_chunk_size
     seed_base   = cfg.simulation.random_seed
+
+    if output_path is None:
+        timestamp = datetime.now().strftime("%H%M%S")
+        base = Path(cfg.output.path)
+        out_path = base.parent / f"{base.stem}_{timestamp}_{n_examples}ex{base.suffix}"
+
+    else:
+        out_path = Path(output_path)
 
     if dry_run:
         n_total = 2
@@ -483,7 +492,7 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
 
     # ── Dry run ──────────────────────────────────────────────────────────────
     if dry_run:
-        for i in range(n_total):
+        for i in range(t_frames):
             labels     = draw_coefficients(cfg, rng)
             mirror_opd = sum(float(c) * m for c, m in zip(labels, zernike_basis))
 
@@ -523,12 +532,15 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"\nWriting {n_total} examples to {out_path} ...")
 
+    if chunk > n_total/2:
+        chunk = max(1,n_total/4)
+
     with h5py.File(out_path, 'w') as f:
         ds_psfs = f.create_dataset(
             'psfs',
-            shape=(n_total, 2, img_size, img_size),
+            shape=(n_total, 2, t_frames, img_size, img_size),
             dtype='float16',
-            chunks=(chunk, 2, img_size, img_size),
+            chunks=(chunk, 2, t_frames, img_size, img_size),
             compression='gzip', compression_opts=4,
         )
         ds_labels = f.create_dataset(
@@ -542,9 +554,9 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
         ds_labels.attrs['n_modes']     = n_modes
         ds_signal = f.create_dataset(
             'signal',
-            shape=(n_total, img_size, img_size),
+            shape=(n_total, t_frames, img_size, img_size),
             dtype='float32',
-            chunks=(chunk, img_size, img_size),
+            chunks=(chunk, t_frames, img_size, img_size),
             compression='gzip', compression_opts=4,
         )
         ds_signal.attrs['description'] = 'Roddier curvature signal S = (I2_rot - I1) / (I2_rot + I1)'
@@ -563,14 +575,14 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
                 cfg, aperture, prop, pupil_grid,
                 wavelengths, weights, img_size,
                 atm,
-            ).mean(axis=0)
+            )
             atm = reset_atm_seed(atm)
             I2m = np.rot90(propagate_polychromatic(
                 mirror_opd, -1.0, defocus_opd_unit, c4_defocus,
                 cfg, aperture, prop, pupil_grid,
                 wavelengths, weights, img_size,
                 atm,
-            ).mean(axis=0), k=2)
+            ), k=2)
             S = (I2m - I1m) / (I2m + I1m + 1e-12)
 
             ds_psfs[row, 0]  = I1m.astype(np.float16)
@@ -578,6 +590,7 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
             ds_signal[row]   = S.astype(np.float32)
             ds_labels[row]   = labels_ex.astype(np.float32)
             row += 1
+            f.flush()
 
             if (ex_idx + 1) % max(1, n_examples // 20) == 0 or ex_idx == n_examples - 1:
                 elapsed = time.time() - t0
@@ -587,10 +600,10 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
                 print(f"  [{done:>{len(str(n_total))}}/{n_total}]  "
                       f"{elapsed:.0f}s  {rate:.2f} ex/s  ETA {eta:.0f}s")
 
-    print(f"\nDone.  HDF5: {out_path}")
-    print(f"  psfs   {ds_psfs.shape}   float16")
-    print(f"  signal {ds_signal.shape} float32")
-    print(f"  labels {ds_labels.shape} float32")
+        print(f"\nDone.  HDF5: {out_path}")
+        print(f"  {'psfs':<8} {str(ds_psfs.shape):<18} float16")
+        print(f"  {'signal':<8} {str(ds_signal.shape):<18} float32")
+        print(f"  {'labels':<8} {str(ds_labels.shape):<18} float32")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
