@@ -31,7 +31,7 @@ optics:
   pixel_oversample: 4
 
   # Pupil grid resolution (samples across diameter).
-  pupil_samples: 256
+  pupil_samples: 128
 
   # Reference wavelength used to anchor the lambda/D grid and as the
   # base wavelength for atmospheric OPD extraction.
@@ -99,8 +99,8 @@ atmosphere:
     wind_direction: 0.0  # radians
 
 simulation:
-  n_examples: 32       # unique Zernike mirror states
-  t_frames: 32           # frames per sequence pair
+  n_examples: 2500       # unique Zernike mirror states
+  t_frames: 8           # frames per sequence pair
   frame_rate: 50.0       # Hz
 
   # Final PSF image size written to HDF5 [img_size x img_size].

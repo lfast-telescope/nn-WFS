@@ -13,7 +13,7 @@ PSF size on a real detector with fixed pixel pitch.
 
 Output HDF5 schema
 ------------------
-psfs   : float16  [N, 2, H, W]   channel 0 = I1 (intra-focal), 1 = I2 (extra-focal)
+psfs   : float16  [N, 3, H, W]   channel 0 = I0 (in-focus), 1 = I1 (intra-focal), 2 = I2 (extra-focal)
 labels : float32  [N, n_modes]   Zernike coefficients Z1..Z{n_modes}, metres OPD
                                   indices 0–2 (Z1 piston, Z2 tip, Z3 tilt) are always zero
 Attributes on 'labels': label_units = 'metres_opd'
@@ -36,7 +36,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import h5py
 import numpy as np
 import yaml
@@ -458,7 +458,7 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
     if output_path is None:
         timestamp = datetime.now().strftime("%H%M%S")
         base = Path(cfg.output.path)
-        out_path = base.parent / f"{base.stem}_{timestamp}_{n_examples}ex{base.suffix}"
+        out_path = base.parent / f"{base.stem}_{n_examples}ex_{t_frames}fr{base.suffix}"
 
     else:
         out_path = Path(output_path)
@@ -538,9 +538,9 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
     with h5py.File(out_path, 'w') as f:
         ds_psfs = f.create_dataset(
             'psfs',
-            shape=(n_total, 2, t_frames, img_size, img_size),
+            shape=(n_total, 3, t_frames, img_size, img_size),
             dtype='float16',
-            chunks=(chunk, 2, t_frames, img_size, img_size),
+            chunks=(chunk, 3, t_frames, img_size, img_size),
             compression='gzip', compression_opts=4,
         )
         ds_labels = f.create_dataset(
@@ -552,22 +552,22 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
         ds_labels.attrs['label_units'] = cfg.output.label_units
         ds_labels.attrs['noll_start']  = 1
         ds_labels.attrs['n_modes']     = n_modes
-        ds_signal = f.create_dataset(
-            'signal',
-            shape=(n_total, t_frames, img_size, img_size),
-            dtype='float32',
-            chunks=(chunk, t_frames, img_size, img_size),
-            compression='gzip', compression_opts=4,
-        )
-        ds_signal.attrs['description'] = 'Roddier curvature signal S = (I2_rot - I1) / (I2_rot + I1)'
         f.attrs['config'] = json.dumps(dict(cfg), default=str)
 
         row = 0
         t0  = time.time()
+        last_time = time.time()
 
         for ex_idx in range(n_examples):
             labels_ex  = draw_coefficients(cfg, rng)
             mirror_opd = sum(float(c) * m for c, m in zip(labels_ex, zernike_basis))
+
+            atm = reset_atm_seed(atm)
+            I0 = propagate_polychromatic(
+                mirror_opd, +1.0, defocus_opd_unit, 0,
+                cfg, aperture, prop, pupil_grid,
+                wavelengths, weights, img_size,
+                atm,)
 
             atm = reset_atm_seed(atm)
             I1m = propagate_polychromatic(
@@ -583,26 +583,27 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
                 wavelengths, weights, img_size,
                 atm,
             ), k=2)
-            S = (I2m - I1m) / (I2m + I1m + 1e-12)
 
-            ds_psfs[row, 0]  = I1m.astype(np.float16)
-            ds_psfs[row, 1]  = I2m.astype(np.float16)
-            ds_signal[row]   = S.astype(np.float32)
+            ds_psfs[row, 0]  = I0.astype(np.float16)
+            ds_psfs[row, 1]  = I1m.astype(np.float16)
+            ds_psfs[row, 2]  = I2m.astype(np.float16)
             ds_labels[row]   = labels_ex.astype(np.float32)
             row += 1
             f.flush()
 
             if (ex_idx + 1) % max(1, n_examples // 20) == 0 or ex_idx == n_examples - 1:
                 elapsed = time.time() - t0
+                interval = time.time() - last_time
+                last_time = time.time()
                 done    = row
                 rate    = done / elapsed if elapsed > 0 else 0
-                eta     = (n_total - done) / rate if rate > 0 else float('inf')
+                eta_seconds     = (n_total - done) / rate if rate > 0 else float('inf')
+                eta_td  = timedelta(seconds=int(eta_seconds))
                 print(f"  [{done:>{len(str(n_total))}}/{n_total}]  "
-                      f"{elapsed:.0f}s  {rate:.2f} ex/s  ETA {eta:.0f}s")
+                    f"{int(elapsed):>5}s  {interval:5.1f}s  {rate:.2f} ex/s  ETA {str(eta_td)}")
 
         print(f"\nDone.  HDF5: {out_path}")
         print(f"  {'psfs':<8} {str(ds_psfs.shape):<18} float16")
-        print(f"  {'signal':<8} {str(ds_signal.shape):<18} float32")
         print(f"  {'labels':<8} {str(ds_labels.shape):<18} float32")
 
 
