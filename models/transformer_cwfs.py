@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 
 try:
-    from .common import PatchEmbed, TransformerBlock, CrossAttentionBlock, MLPHead
+    from .common import PatchEmbed, TransformerBlock, CrossAttentionBlock, MLPHead, encode_and_pool
 except ImportError:
-    from models.common import PatchEmbed, TransformerBlock, CrossAttentionBlock, MLPHead
+    from models.common import PatchEmbed, TransformerBlock, CrossAttentionBlock, MLPHead, encode_and_pool
 
 
 class TransformerCWFS(nn.Module):
@@ -33,11 +33,13 @@ class TransformerCWFS(nn.Module):
     patch_size     : int   — patch side length; 16 → 256 tokens, 32 → 64 tokens
     embed_dim      : int   — token dimension D
     n_enc_blocks   : int   — Stage-1 self-attention blocks (default 4)
-    n_cross_blocks : int   — Stage-3 cross-attention blocks (default 2; minimum 2)
+    n_cross_blocks : int   — Stage-3 cross-attention blocks (default 2; minimum 1 for
+                             two_stream/pairs, 0 allowed for r_stack)
     n_heads        : int   — attention heads (embed_dim must be divisible by n_heads)
     ffn_mult       : int   — FFN hidden-dim multiplier
     dropout        : float — dropout probability in attention and FFN layers
     n_outputs      : int   — number of Zernike coefficients to predict (default 14)
+    input_mode     : str   — 'two_stream' (default) | 'r_stack' | 'pairs'
     """
 
     def __init__(
@@ -51,10 +53,14 @@ class TransformerCWFS(nn.Module):
         ffn_mult: int = 4,
         dropout: float = 0.0,
         n_outputs: int = 14,
+        input_mode: str = 'two_stream',
     ):
         super().__init__()
-        if n_cross_blocks < 2:
-            raise ValueError("n_cross_blocks must be at least 2")
+        if input_mode not in ('two_stream', 'r_stack', 'pairs'):
+            raise ValueError(f"Unknown input_mode '{input_mode}'")
+        if input_mode in ('pairs', 'two_stream') and n_cross_blocks < 1:
+            raise ValueError("n_cross_blocks must be at least 1")
+        self.input_mode = input_mode
 
         # --- Stage 1: shared patch tokeniser + positional embedding ---
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans=1, embed_dim=embed_dim)
@@ -97,36 +103,54 @@ class TransformerCWFS(nn.Module):
             tokens = block(tokens)
         return tokens
 
-    def forward(
+    def _encode_and_pool(self, frames: torch.Tensor) -> torch.Tensor:
+        """frames: [B, T, H, W] → per-frame encode + mean pool → [B, N, D]"""
+        return encode_and_pool(frames, self._encode)
+
+    def _forward_pairs(
         self,
         I1: torch.Tensor,
         I2: torch.Tensor,
-        r: torch.Tensor,
+        r:  torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        I1 : Tensor[B, 1, H, W]  — intra-focal mean PSF
-        I2 : Tensor[B, 1, H, W]  — extra-focal mean PSF
-        r  : Tensor[B, 1, H, W]  — Roddier normalised-difference signal
-
-        Returns
-        -------
-        Tensor[B, n_outputs]  — predicted Zernike coefficients Z2..Z15
-        """
-        f1 = self._encode(I1)   # [B, N, D]
+        # I1, I2, r: [B, 1, H, W]
+        f1 = self._encode(I1)
         f2 = self._encode(I2)
         fr = self._encode(r)
-
-        # Cross-stream attention cascade.
-        # Block 0:      Q = f1,  KV = f2   (intra vs. extra-focal)
-        # Block 1:      Q = out, KV = fr   (refine with Roddier signal)
-        # Block k >= 2: alternate KV source (f2 for even k, fr for odd k)
         kv_sources = [f2, fr]
         q = f1
         for k, cross_block in enumerate(self.cross_attn):
-            kv = kv_sources[min(k, 1)]   # block 0 → f2; blocks 1+ → fr
+            kv = kv_sources[k % 2]   # even k → f2; odd k → fr
             q = cross_block(q, kv)
+        return self.head(self.norm(q).mean(dim=1))
 
-        pooled = self.norm(q).mean(dim=1)   # [B, D]
-        return self.head(pooled)
+    def _forward_two_stream(
+        self,
+        I1: torch.Tensor,
+        I2: torch.Tensor,
+    ) -> torch.Tensor:
+        # I1, I2: [B, T, H, W]
+        f1 = self._encode_and_pool(I1)   # [B, N, D]
+        f2 = self._encode_and_pool(I2)   # [B, N, D]
+        q = f1
+        for cross_block in self.cross_attn:
+            q = cross_block(q, f2)       # all blocks use f2 as kv
+        return self.head(self.norm(q).mean(dim=1))
+
+    def _forward_r_stack(
+        self,
+        R: torch.Tensor,
+    ) -> torch.Tensor:
+        # R: [B, T², H, W] — each frame is an independent sample
+        B, TT, H, W = R.shape
+        flat = R.reshape(B * TT, 1, H, W)              # [B*T², 1, H, W]
+        tokens = self._encode(flat)                     # [B*T², N, D]
+        return self.head(self.norm(tokens).mean(dim=1)) # [B*T², n_outputs]
+
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        if self.input_mode == 'pairs':
+            return self._forward_pairs(*args, **kwargs)
+        elif self.input_mode == 'two_stream':
+            return self._forward_two_stream(*args, **kwargs)
+        else:
+            return self._forward_r_stack(*args, **kwargs)

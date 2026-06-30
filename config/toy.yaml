@@ -1,23 +1,19 @@
 model:
-  type: transformer
-  input_mode: two_stream
+  type: toy
+  input_mode: r_stack
   img_size: 256
   patch_size: 16
-  embed_dim: 256
-  n_enc_blocks: 4
-  n_cross_blocks: 2
-  n_heads: 8
-  ffn_mult: 4
+  embed_dim: 128
   dropout: 0.1
-  n_outputs: 14
+  n_outputs: 36
 
 data:
   hdf5_path: null         # override on the command line: --hdf5_path /path/to/data.h5
   split_ratios: [0.80, 0.10, 0.10]
   split_seed: 42
-  batch_size: 128
+  batch_size: 16         
   num_workers: 4
-  augment: true           # apply D4Augment during training
+  augment: false
   return_stacks: true
 
 training:
@@ -30,6 +26,6 @@ training:
   compile_mode: reduce-overhead  # 'reduce-overhead' (fast), 'default' (balanced), false/null to disable
 
 logging:
-  checkpoint_dir: checkpoints/transformer
-  log_interval: 10       # log metrics every N batches
-  save_top_k: 3           # keep the best k checkpoints by val WFE rms
+  checkpoint_dir: checkpoints/toy
+  log_interval: 2
+  save_top_k: 3

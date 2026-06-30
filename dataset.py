@@ -11,39 +11,75 @@ class CWFSDataset(Dataset):
     """
     Lazy-loading PyTorch Dataset for Curvature WFS training data stored in HDF5.
 
-    Expected HDF5 schema
-    --------------------
-    psfs   : float16  [N, 2, H, W]  — channel 0 = intra-focal, 1 = extra-focal
-    labels : float32  [N, 14]       — Zernike coefficients Z2..Z15 (Noll ordering)
+    Supported HDF5 schemas
+    ----------------------
+    Temporal (5-D, written by make_training_data.py):
+        psfs   : float16  [N, 2, T, H, W]
+                    channel 0 = I1 (intra-focal, T frames)
+                    channel 1 = I2 (extra-focal, T frames)
+        labels : float32  [N, n_modes]
 
-    The Roddier normalised-difference signal
-        r = (I1 - I2) / (I1 + I2 + eps)
-    is computed on-the-fly in __getitem__ and returned as a third tensor,
-    so it does not need to be stored on disk.
+    Legacy (4-D):
+        psfs   : float16  [N, 2, H, W]  — channel 0 = I1, channel 1 = I2
+        labels : float32  [N, n_modes]
+
+    Temporal frame-pair expansion
+    -----------------------------
+    Because I1 and I2 are temporally incoherent, every combination of one
+    I1 frame with one I2 frame is a valid, independent training sample for the
+    same Zernike label.  For T frames per stream, each HDF5 example contributes
+    T² dataset items.  __len__ therefore returns len(indices) * T * T, and
+    __getitem__ maps a flat index k to (example, frame_i, frame_j):
+
+        example = k // (T * T)
+        frame_i = (k //  T   ) % T   ← which I1 frame
+        frame_j =  k           % T   ← which I2 frame
+
+    The train/val/test split is performed at the example level (by
+    train_val_test_split), so all T² pairs from a given example belong to
+    exactly one split — no data leakage.
+
+    The Roddier signal r = (I1 - I2) / (I1 + I2 + eps) is computed
+    on-the-fly from the selected frame pair.
 
     Parameters
     ----------
     hdf5_path : str
-        Path to the HDF5 file produced by make_training_data.py.
     indices : array-like of int
-        Sample indices to expose.  Allows train / val / test views of the same
-        file without copying data.  Use train_val_test_split() to generate these.
+        HDF5 example indices (example-level, not item-level).
+        Use train_val_test_split() to generate these.
     label_stats : dict or None
-        Optional {'mean': ndarray[14], 'std': ndarray[14]} for z-score
-        normalisation of labels.  Compute once with compute_label_stats() and
-        pass the result here.  If None, raw coefficient values are returned.
+        Optional {'mean': ndarray, 'std': ndarray} for z-score normalisation.
     transform : callable or None
-        Optional callable applied to the sample dict after loading.
-        Expected signature: transform(sample: dict) -> dict.
-        See utils/augmentation.py for D4Augment.
+        Applied to the sample dict after construction.
+        Not supported when return_stacks=True.
+    return_stacks : bool
+        If False (default): T² item expansion — each example yields T² items,
+        each item returns {I1:[1,H,W], I2:[1,H,W], r:[1,H,W], labels}.
+        If True: 1 item per example, returns
+        {I1:[T,H,W], I2:[T,H,W], R:[T²,H,W], labels}.
+        Required for input_mode='two_stream' or 'r_stack'.
     """
 
-    def __init__(self, hdf5_path, indices, label_stats=None, transform=None):
+    def __init__(self, hdf5_path, indices, label_stats=None, transform=None, return_stacks=False):
         self.path = str(hdf5_path)
         self.indices = np.asarray(indices, dtype=np.int64)
         self.label_stats = label_stats
         self.transform = transform
+        self.return_stacks = return_stacks
         self._file = None          # opened lazily; one handle per DataLoader worker
+
+        # Detect schema and store T (frames per stream).
+        with h5py.File(self.path, 'r') as f:
+            shape = f['psfs'].shape   # (N, 2, T, H, W) or (N, 2, H, W)
+        self._temporal = (len(shape) == 5)
+        self.T = int(shape[2]) if self._temporal else 1
+
+        if return_stacks and transform is not None:
+            raise ValueError(
+                "transform is not supported with return_stacks=True. "
+                "Disable augmentation in the data config when using stack input modes."
+            )
 
     # ------------------------------------------------------------------
     # pickling: drop the open file handle so forked workers open fresh
@@ -54,21 +90,67 @@ class CWFSDataset(Dataset):
         return state
 
     def __len__(self):
-        return len(self.indices)
+        if self.return_stacks:
+            return len(self.indices)
+        return len(self.indices) * self.T * self.T
 
     def __getitem__(self, idx):
         if self._file is None:
             self._file = h5py.File(self.path, 'r')
 
-        i = int(self.indices[idx])
-        psf_pair = self._file['psfs'][i].astype(np.float32)   # [2, H, W]
-        raw_labels = self._file['labels'][i]                    # [14]
+        if self.return_stacks:
+            # ── stack mode: one item per example, returns all T frames ──
+            i = int(self.indices[idx])
+            if self._temporal:
+                I1 = torch.from_numpy(
+                    self._file['psfs'][i, 0].astype(np.float32)   # [T, H, W]
+                )
+                I2 = torch.from_numpy(
+                    self._file['psfs'][i, 1].astype(np.float32)   # [T, H, W]
+                )
+            else:
+                psf_pair = self._file['psfs'][i].astype(np.float32)  # [2, H, W]
+                I1 = torch.from_numpy(psf_pair[0]).unsqueeze(0)      # [1, H, W]
+                I2 = torch.from_numpy(psf_pair[1]).unsqueeze(0)      # [1, H, W]
 
-        I1 = torch.from_numpy(psf_pair[0]).unsqueeze(0)        # [1, H, W]
-        I2 = torch.from_numpy(psf_pair[1]).unsqueeze(0)        # [1, H, W]
+            # Compute all T² Roddier combinations via broadcasting.
+            T = I1.shape[0]
+            I1_exp = I1.unsqueeze(1)   # [T, 1, H, W]
+            I2_exp = I2.unsqueeze(0)   # [1, T, H, W]
+            R = (I1_exp - I2_exp) / (I1_exp + I2_exp + EPS_RODDIER)  # [T, T, H, W]
+            R = R.reshape(T * T, *R.shape[2:])                        # [T², H, W]
+
+            raw_labels = self._file['labels'][i]
+            labels = torch.from_numpy(raw_labels.astype(np.float32))
+            if self.label_stats is not None:
+                mean = torch.as_tensor(self.label_stats['mean'], dtype=torch.float32)
+                std  = torch.as_tensor(self.label_stats['std'],  dtype=torch.float32)
+                labels = (labels - mean) / (std + 1e-8)
+            return {'I1': I1, 'I2': I2, 'R': R, 'labels': labels}
+
+        # ── pair-expansion mode: T² items per example ──
+        if self._temporal:
+            T = self.T
+            example_idx = idx // (T * T)
+            frame_i     = (idx // T) % T
+            frame_j     = idx % T
+            i = int(self.indices[example_idx])
+            I1 = torch.from_numpy(
+                self._file['psfs'][i, 0, frame_i].astype(np.float32)
+            ).unsqueeze(0)                                      # [1, H, W]
+            I2 = torch.from_numpy(
+                self._file['psfs'][i, 1, frame_j].astype(np.float32)
+            ).unsqueeze(0)                                      # [1, H, W]
+        else:
+            i = int(self.indices[idx])
+            psf_pair = self._file['psfs'][i].astype(np.float32) # [2, H, W]
+            I1 = torch.from_numpy(psf_pair[0]).unsqueeze(0)    # [1, H, W]
+            I2 = torch.from_numpy(psf_pair[1]).unsqueeze(0)    # [1, H, W]
+
         r  = (I1 - I2) / (I1 + I2 + EPS_RODDIER)              # [1, H, W]
 
-        labels = torch.from_numpy(raw_labels.astype(np.float32))  # [14]
+        raw_labels = self._file['labels'][i]                    # [n_modes]
+        labels = torch.from_numpy(raw_labels.astype(np.float32))
 
         if self.label_stats is not None:
             mean = torch.as_tensor(self.label_stats['mean'], dtype=torch.float32)
@@ -106,7 +188,13 @@ def train_val_test_split(hdf5_path, ratios=(0.80, 0.10, 0.10), seed=42):
         raise ValueError(f"Ratios must sum to 1.0, got {sum(ratios):.6f}")
 
     with h5py.File(hdf5_path, 'r') as f:
-        N = f['labels'].shape[0]
+        valid_indices = np.array(
+            [i for i, row in enumerate(f['labels']) if np.max(row) > 0],
+            dtype=np.int64,
+        )
+    N = len(valid_indices)
+    if N == 0:
+        raise ValueError(f"No valid (non-zero) examples found in {hdf5_path}")
 
     rng = np.random.default_rng(seed)
     perm = rng.permutation(N).astype(np.int64)
@@ -114,11 +202,31 @@ def train_val_test_split(hdf5_path, ratios=(0.80, 0.10, 0.10), seed=42):
     n_train = int(N * ratios[0])
     n_val   = int(N * ratios[1])
 
-    train_idx = perm[:n_train]
-    val_idx   = perm[n_train : n_train + n_val]
-    test_idx  = perm[n_train + n_val :]
+    train_idx = valid_indices[perm[:n_train]]
+    val_idx   = valid_indices[perm[n_train : n_train + n_val]]
+    test_idx  = valid_indices[perm[n_train + n_val :]]
 
     return train_idx, val_idx, test_idx
+
+
+def get_n_modes(hdf5_path: str) -> int:
+    """
+    Read the number of Zernike modes from an HDF5 file produced by
+    make_training_data.py.
+
+    Uses the stored ``labels.attrs['n_modes']`` attribute when available;
+    falls back to ``labels.shape[1]`` for files written without the attribute.
+    Raises ValueError if the two values are present but disagree.
+    """
+    with h5py.File(hdf5_path, 'r') as f:
+        n_from_shape = f['labels'].shape[1]
+        n_from_attr  = f['labels'].attrs.get('n_modes', None)
+    if n_from_attr is not None and int(n_from_attr) != n_from_shape:
+        raise ValueError(
+            f"{hdf5_path}: labels.attrs['n_modes']={n_from_attr} does not match "
+            f"labels.shape[1]={n_from_shape}.  The HDF5 file may be corrupt."
+        )
+    return n_from_shape
 
 
 def compute_label_stats(hdf5_path, train_indices):

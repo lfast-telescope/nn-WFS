@@ -18,6 +18,7 @@ are deleted automatically.
 # %%
 import argparse
 import heapq
+import inspect
 import math
 import os
 import sys
@@ -39,12 +40,12 @@ _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
-from dataset import CWFSDataset, train_val_test_split, compute_label_stats
+from dataset import CWFSDataset, train_val_test_split, compute_label_stats, get_n_modes
 from models.transformer_cwfs import TransformerCWFS
 from models.cnn_cwfs import CNNCWFS
+from models.toy_model import SLPCWFS
 from utils.augmentation import D4Augment
 from utils.metrics import per_mode_rms, total_wfe_rms, strehl_proxy
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Config helpers
@@ -100,12 +101,13 @@ def build_model(cfg: dict) -> nn.Module:
     model_type = mc['type'].lower()
     kwargs = {k: v for k, v in mc.items() if k != 'type'}
 
-    if model_type == 'transformer':
-        return TransformerCWFS(**kwargs)
-    elif model_type == 'cnn':
-        return CNNCWFS(**kwargs)
-    else:
-        raise ValueError(f"Unknown model type '{model_type}'. Choose 'transformer' or 'cnn'.")
+    registry = {'transformer': TransformerCWFS, 'cnn': CNNCWFS, 'toy': SLPCWFS}
+    if model_type not in registry:
+        raise ValueError(f"Unknown model type '{model_type}'. Choose from: {list(registry)}")
+
+    cls = registry[model_type]
+    accepted = inspect.signature(cls.__init__).parameters
+    return cls(**{k: v for k, v in kwargs.items() if k in accepted})
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -166,6 +168,7 @@ def _run_epoch(
     grad_clip: float,
     log_interval: int,
     is_train: bool,
+    n_outputs: int = None,
 ) -> dict:
     """
     Run one epoch.  Returns a dict of scalar metrics.
@@ -173,31 +176,56 @@ def _run_epoch(
     During training (is_train=True) the model is updated with AMP and
     gradient clipping.  During validation the model runs in eval mode with
     no gradient computation.
-
+    Parameters
+    ----------
+    n_outputs : int, optional
+        If set, truncate labels to first n_outputs columns (subset mode training).
+        If None, use all columns from labels.
     Loss
     ----
-    L1 on z-scored Zernike labels so each mode is weighted equally regardless
-    of its physical amplitude.  Physical-unit metrics (WFE rms, Strehl proxy)
+    L2 (MSE) on z-scored Zernike labels.  Physical-unit metrics (WFE rms, Strehl proxy)
     are computed after denormalising predictions.
     """
     model.train(is_train)
-    criterion = nn.L1Loss()
+    criterion = nn.MSELoss()
 
     total_loss = 0.0
     all_pred   = []
     all_target = []
     t0 = time.time()
+    
+    # Prepare label stats for subset mode if needed
+    lm = label_mean.to(device)
+    ls = label_std.to(device)
+    if n_outputs is not None:
+        lm = lm[:n_outputs]
+        ls = ls[:n_outputs]
 
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
         for batch_idx, batch in enumerate(loader):
-            I1     = batch['I1'].to(device, non_blocking=True)
-            I2     = batch['I2'].to(device, non_blocking=True)
-            r      = batch['r'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)   # z-scored
+            
+            # Truncate labels to subset if subset mode training
+            if n_outputs is not None:
+                labels = labels[:, :n_outputs]
 
+            input_mode = getattr(model, 'input_mode', 'pairs')
             with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                pred = model(I1, I2, r)
+                if input_mode == 'two_stream':
+                    I1 = batch['I1'].to(device, non_blocking=True)
+                    I2 = batch['I2'].to(device, non_blocking=True)
+                    pred = model(I1, I2)
+                elif input_mode == 'r_stack':
+                    R = batch['R'].to(device, non_blocking=True)
+                    pred = model(R)                                        # [B*T², n_outputs]
+                    TT = pred.shape[0] // labels.shape[0]
+                    labels = labels.repeat_interleave(TT, dim=0)           # [B*T², n_modes]
+                else:  # 'pairs'
+                    I1 = batch['I1'].to(device, non_blocking=True)
+                    I2 = batch['I2'].to(device, non_blocking=True)
+                    r  = batch['r'].to(device, non_blocking=True)
+                    pred = model(I1, I2, r)
                 loss = criterion(pred, labels)
 
             if is_train:
@@ -217,17 +245,25 @@ def _run_epoch(
             total_loss += loss.item()
 
             # accumulate denormalised predictions for physical metrics
-            lm = label_mean.to(device)
-            ls = label_std.to(device)
             all_pred.append((pred.detach() * ls + lm).cpu())
             all_target.append((labels.detach() * ls + lm).cpu())
 
-            if is_train and log_interval > 0 and (batch_idx + 1) % log_interval == 0:
-                elapsed = time.time() - t0
-                lr = scheduler.get_last_lr()[0]
-                print(f"  batch {batch_idx+1}/{len(loader)}  "
-                      f"loss={total_loss/(batch_idx+1):.4f}  "
-                      f"lr={lr:.2e}  elapsed={elapsed:.0f}s")
+            # Intermediate logging
+            elapsed = time.time() - t0
+            avg_loss = total_loss / (batch_idx + 1)
+            batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+            remaining_batches = len(loader) - (batch_idx + 1)
+            eta_sec = remaining_batches / batches_per_sec if batches_per_sec > 0 else 0
+            
+            phase = "train" if is_train else "val"
+            if log_interval > 0 and (batch_idx + 1) % log_interval == 0:
+                print(f"  [{phase}] batch {batch_idx+1:4d}/{len(loader)}  "
+                      f"loss={avg_loss:.4f}  "
+                      f"time={elapsed:6.0f}s  eta={eta_sec:5.0f}s", end="")
+                if is_train:
+                    lr = scheduler.get_last_lr()[0]
+                    print(f"  lr={lr:.2e}", end="")
+                print()
 
     all_pred   = torch.cat(all_pred,   dim=0)
     all_target = torch.cat(all_target, dim=0)
@@ -276,6 +312,23 @@ def train(cfg: dict) -> None:
     if not hdf5_path:
         raise ValueError("data.hdf5_path must be set in config or via --hdf5_path")
 
+    n_modes_hdf5  = get_n_modes(hdf5_path)
+    n_outputs_cfg = mc.get('n_outputs', None)
+    if n_outputs_cfg is None:
+        raise ValueError("model.n_outputs must be set in the model config.")
+    if n_outputs_cfg > n_modes_hdf5:
+        raise ValueError(
+            f"n_outputs mismatch: model requests {n_outputs_cfg} modes but "
+            f"HDF5 only has {n_modes_hdf5} label columns.  "
+            f"Either reduce model.n_outputs or use a dataset with more modes."
+        )
+    
+    # Subset mode: training on fewer modes than available in HDF5
+    subset_mode = n_outputs_cfg < n_modes_hdf5
+    if subset_mode:
+        print(f"\nSubset mode: training on Z2–Z{n_outputs_cfg+1} ({n_outputs_cfg} modes) "
+              f"from HDF5 with {n_modes_hdf5} available modes")
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
@@ -291,12 +344,15 @@ def train(cfg: dict) -> None:
     label_std  = torch.from_numpy(stats['std'])
 
     # ── datasets & loaders ────────────────────────────────────────────
-    augment = D4Augment() if dc.get('augment', True) else None
-    train_ds = CWFSDataset(hdf5_path, train_idx, label_stats=stats, transform=augment)
-    val_ds   = CWFSDataset(hdf5_path, val_idx,   label_stats=stats)
+    return_stacks = dc.get('return_stacks', False)
+    augment = D4Augment() if dc.get('augment', True) and not return_stacks else None
+    train_ds = CWFSDataset(hdf5_path, train_idx, label_stats=stats, transform=augment,
+                           return_stacks=return_stacks)
+    val_ds   = CWFSDataset(hdf5_path, val_idx,   label_stats=stats,
+                           return_stacks=return_stacks)
 
     n_workers = dc.get('num_workers', 4)
-    batch_size = dc.get('batch_size', 128)
+    batch_size = dc.get('batch_size', 64)
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
@@ -310,6 +366,17 @@ def train(cfg: dict) -> None:
     model = build_model(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model: {mc['type']}  ({n_params:.2f} M parameters)")
+
+    # ── compile (JIT) ─────────────────────────────────────────────────
+    compile_mode = tc.get('compile_mode', 'reduce-overhead')
+    if compile_mode and device.type == 'cuda':
+        try:
+            model = torch.compile(model, mode=compile_mode)
+            print(f"Model compiled with mode '{compile_mode}'")
+            print("  (first batch will be slow for JIT compilation; subsequent batches ≈3-5× faster)")
+        except Exception as e:
+            print(f"Compilation failed; running eagerly: {e}")
+            model = model
 
     # ── optimiser & scheduler ─────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -326,24 +393,64 @@ def train(cfg: dict) -> None:
     )
 
     use_amp = tc.get('amp', True) and device.type == 'cuda'
-    scaler  = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler  = torch.amp.GradScaler('cuda') if use_amp else None
 
     # ── checkpoint manager ────────────────────────────────────────────
     ckpt_mgr = CheckpointManager(lc['checkpoint_dir'], save_top_k=lc.get('save_top_k', 3))
 
+    # ── early stopping ────────────────────────────────────────────────
+    es_patience  = tc.get('early_stopping_patience', 30)
+    es_min_delta = tc.get('early_stopping_min_delta', 0.0)
+    es_counter   = 0
+
+    # ── run summary ───────────────────────────────────────────────────
+    input_mode = mc.get('input_mode', 'pairs')
+    T   = train_ds.T
+    eff_bs = batch_size * (T * T if input_mode == 'r_stack' else 1)
+    print(f"\n{'─'*60}")
+    print(f"  Model        {mc['type']}  ({n_params:.2f}M params)")
+    print(f"  Input mode   {input_mode}")
+    print(f"  Temporal T   {T}  \u2192  {T*T} Roddier combinations/example")
+    if input_mode == 'r_stack':
+        print(f"  Batch size   {batch_size}  (effective {eff_bs} after T\u00b2 expansion)")
+    else:
+        print(f"  Batch size   {batch_size}")
+    if subset_mode:
+        print(f"  n_modes      {n_outputs_cfg} (trained on Z2–Z{n_outputs_cfg+1}) / {n_modes_hdf5} available")
+    else:
+        print(f"  n_modes      {n_modes_hdf5}")
+    print(f"  Device       {device}")
+    print(f"  Train        {len(train_idx)} examples  ({len(train_loader)} batches/epoch)")
+    print(f"  Val          {len(val_idx)} examples")
+    print(f"  LR           {tc['lr']}   weight_decay={tc['weight_decay']}")
+    print(f"  Epochs       {epochs}   patience={es_patience}   min_delta={es_min_delta}")
+    print(f"  AMP          {use_amp}")
+    print(f"  Checkpoints  {lc['checkpoint_dir']}")
+    print(f"{'─'*60}")
+
+    # ── warm-up data loaders ──────────────────────────────────────────
+    if False:
+        print("Warming up data loaders...")
+        _ = next(iter(train_loader))  # Triggers HDF5 init + workers + augmentation
+        _ = next(iter(val_loader))    # Triggers HDF5 init + workers (no augmentation)
+        print("Warmup complete.\n")
+
     # ── training loop ─────────────────────────────────────────────────
     best_val_wfe = float('inf')
+    t_train_start = time.time()
     for epoch in range(1, epochs + 1):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{epochs}")
         print('='*60)
 
+        t_epoch = time.time()
         train_metrics = _run_epoch(
             model, train_loader, optimizer, scaler, scheduler, device,
             label_std, label_mean,
             grad_clip=tc.get('grad_clip', 1.0),
             log_interval=lc.get('log_interval', 100),
             is_train=True,
+            n_outputs=n_outputs_cfg if subset_mode else None,
         )
         val_metrics = _run_epoch(
             model, val_loader, optimizer, scaler, scheduler, device,
@@ -351,21 +458,28 @@ def train(cfg: dict) -> None:
             grad_clip=tc.get('grad_clip', 1.0),
             log_interval=0,
             is_train=False,
+            n_outputs=n_outputs_cfg if subset_mode else None,
         )
+        epoch_elapsed = time.time() - t_epoch
 
         print(f"  Train loss={train_metrics['loss']:.4f}  "
               f"WFE={train_metrics['wfe_rms']*1e9:.1f} nm  "
               f"Strehl={train_metrics['strehl']:.3f}")
         print(f"  Val   loss={val_metrics['loss']:.4f}  "
               f"WFE={val_metrics['wfe_rms']*1e9:.1f} nm  "
-              f"Strehl={val_metrics['strehl']:.3f}")
-        print("  Per-mode val RMS (nm):")
-        for name, rms in zip(NOLL_NAMES, val_metrics['mode_rms']):
+              f"Strehl={val_metrics['strehl']:.3f}  "
+              f"[{epoch_elapsed:.0f}s]")
+        mode_range = n_outputs_cfg if subset_mode else n_modes_hdf5
+        subset_note = " [subset mode]" if subset_mode else ""
+        print(f"  Per-mode val RMS (nm):{subset_note}")
+        for i, rms in enumerate(val_metrics['mode_rms'][:mode_range]):
+            name = NOLL_NAMES[i] if i < len(NOLL_NAMES) else f"Z{i+2}"
             print(f"    {name:<28s} {rms*1e9:6.1f}")
 
         val_wfe = val_metrics['wfe_rms']
-        if val_wfe < best_val_wfe:
+        if val_wfe < best_val_wfe - es_min_delta:
             best_val_wfe = val_wfe
+            es_counter   = 0
             ckpt_state = {
                 'epoch':       epoch,
                 'model_state': model.state_dict(),
@@ -377,8 +491,16 @@ def train(cfg: dict) -> None:
             }
             ckpt_mgr.save(ckpt_state, val_wfe, epoch)
             print(f"  *** New best val WFE: {val_wfe*1e9:.1f} nm — checkpoint saved ***")
+        else:
+            es_counter += 1
+            print(f"  No improvement ({es_counter}/{es_patience})")
+            if es_counter >= es_patience:
+                print(f"  Early stopping triggered after {epoch} epochs.")
+                break
 
-    print(f"\nTraining complete.  Best val WFE: {best_val_wfe*1e9:.1f} nm")
+    total_elapsed = time.time() - t_train_start
+    print(f"\nTraining complete.  Best val WFE: {best_val_wfe*1e9:.1f} nm  "
+          f"(total {total_elapsed/60:.1f} min)")
     print(f"Best checkpoint: {ckpt_mgr.best_path()}")
 
 
