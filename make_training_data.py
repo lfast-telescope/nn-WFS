@@ -13,9 +13,9 @@ PSF size on a real detector with fixed pixel pitch.
 
 Output HDF5 schema
 ------------------
-psfs   : float16  [N, 3, H, W]   channel 0 = I0 (in-focus), 1 = I1 (intra-focal), 2 = I2 (extra-focal)
-labels : float32  [N, n_modes]   Zernike coefficients Z1..Z{n_modes}, metres OPD
-                                  indices 0–2 (Z1 piston, Z2 tip, Z3 tilt) are always zero
+psfs   : float16  [N, 2, T, H, W]  channel 0 = I1 (intra-focal), 1 = I2 (extra-focal)
+labels : float32  [N, n_modes]     Zernike coefficients Z1..Z{n_modes}, metres OPD
+                                    indices 0–2 (Z1 piston, Z2 tip, Z3 tilt) are always zero
 Attributes on 'labels': label_units = 'metres_opd'
 
 Usage
@@ -538,9 +538,9 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
     with h5py.File(out_path, 'w') as f:
         ds_psfs = f.create_dataset(
             'psfs',
-            shape=(n_total, 3, t_frames, img_size, img_size),
+            shape=(n_total, 2, t_frames, img_size, img_size),
             dtype='float16',
-            chunks=(chunk, 3, t_frames, img_size, img_size),
+            chunks=(chunk, 2, t_frames, img_size, img_size),
             compression='gzip', compression_opts=4,
         )
         ds_labels = f.create_dataset(
@@ -559,15 +559,21 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
         last_time = time.time()
 
         for ex_idx in range(n_examples):
+            start_time = time.time()
             labels_ex  = draw_coefficients(cfg, rng)
+            if True: #measured values for M10
+                from scipy.ndimage import gaussian_filter
+                labels_ex = np.array([ 0,  0,  0,  0.00357185,  0,
+                                       -0.00573468, -0.00146731,  0.0019003 , -0.00451308,  0.01534035,
+                                       -0.00153402,  0.00159377, -0.03138667,  0.00059039,  0.00120527,
+                                       -0.00099496, -0.00098309, -0.00525709, -0.00473997, -0.01460854,
+                                       -0.00064142,  0.00034417,  0.00068143, -0.00876478,  0.02190548,
+                                       0.00241134, -0.0015036 , -0.0010248 ,  0.00082468,  0.00108903,
+                                       0.00344091,  0.00198354,  0.00371751,  0.00064398,  0.00052905,
+                                       -0.00070846,  0.00024218, -0.00044527,  0.00135207,  0.00584624,
+                                       -0.00551072,  0.00388207,  0.00019439,  0.00066226,  0.00016089])[:36] * 1e-9
+            
             mirror_opd = sum(float(c) * m for c, m in zip(labels_ex, zernike_basis))
-
-            atm = reset_atm_seed(atm)
-            I0 = propagate_polychromatic(
-                mirror_opd, +1.0, defocus_opd_unit, 0,
-                cfg, aperture, prop, pupil_grid,
-                wavelengths, weights, img_size,
-                atm,)
 
             atm = reset_atm_seed(atm)
             I1m = propagate_polychromatic(
@@ -584,14 +590,22 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
                 atm,
             ), k=2)
 
-            ds_psfs[row, 0]  = I0.astype(np.float16)
-            ds_psfs[row, 1]  = I1m.astype(np.float16)
-            ds_psfs[row, 2]  = I2m.astype(np.float16)
+            tmpname = os.path.join(os.getcwd(),'tmp')
+            avgsize = 3
+            R = (np.mean(I1m[:avgsize],0)-np.mean(I2m[:avgsize],0))/(np.mean(I1m[:avgsize],0)+np.mean(I2m[:avgsize],0))
+            os.makedirs(tmpname, exist_ok=True)
+            plt.imshow(gaussian_filter(R,1))
+            plt.colorbar()
+            plt.title(f"idx:{ex_idx} time: {time.time()-start_time}s")
+            plt.savefig(os.path.join(tmpname,'debug_fig.png'))
+
+            ds_psfs[row, 0]  = I1m.astype(np.float16)
+            ds_psfs[row, 1]  = I2m.astype(np.float16)
             ds_labels[row]   = labels_ex.astype(np.float32)
             row += 1
             f.flush()
 
-            if (ex_idx + 1) % max(1, n_examples // 20) == 0 or ex_idx == n_examples - 1:
+            if (ex_idx % 2) == 0 or ex_idx == n_examples - 1:
                 elapsed = time.time() - t0
                 interval = time.time() - last_time
                 last_time = time.time()

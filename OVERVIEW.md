@@ -30,7 +30,7 @@ fixed at ΔW = 4.5 × 545 nm.
 
 ```
 nn_CWFS/
-├── make_training_data.py   — synthetic PSF generation (hcipy; stub, deferred)
+├── make_training_data.py   — synthetic PSF generation with hcipy
 ├── dataset.py              — lazy HDF5 data loading, train/val/test split
 ├── utils/
 │   ├── augmentation.py     — D4 dihedral symmetry augmentation
@@ -38,9 +38,11 @@ nn_CWFS/
 ├── models/
 │   ├── common.py           — shared building blocks (PatchEmbed, attention blocks, MLP head)
 │   ├── transformer_cwfs.py — Transformer-CWFS architecture
-│   └── cnn_cwfs.py         — Siamese ResNet-CWFS architecture
+│   ├── cnn_cwfs.py         — Siamese ResNet-CWFS architecture
+|   └── toy_model.py
 ├── config/
 │   ├── transformer.yaml    — hyperparameter config for TransformerCWFS
+│   ├── toy_model.yaml    — hyperparameter config for toy_model
 │   └── cnn.yaml            — hyperparameter config for CNNCWFS
 ├── train.py                — unified training loop (both model types)
 └── evaluate.py             — evaluation, model comparison, ablation, fine-tuning

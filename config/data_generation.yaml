@@ -23,7 +23,7 @@ optics:
   #            the longest wavelength.  Verify empirically with check_grid_extent.
   # Currently: match with 4x oversampled pixels on LFAST ZWO ASI183 cam
   q: 3.025
-  num_airy: 338.5
+  num_airy: 138 #valid+faster but doesn't make sense why this is <169.25-subtense on cam
 
   # Sub-pixel oversampling factor.  The focal grid is sampled at
   # (img_size * pixel_oversample)^2 and binned to img_size^2 after
@@ -31,7 +31,7 @@ optics:
   pixel_oversample: 4
 
   # Pupil grid resolution (samples across diameter).
-  pupil_samples: 128
+  pupil_samples: 256
 
   # Reference wavelength used to anchor the lambda/D grid and as the
   # base wavelength for atmospheric OPD extraction.
@@ -42,7 +42,7 @@ wavelengths:
   # Sampling is uniform in wavenumber (1/lambda) to give equal photon-energy spacing.
   lambda_min: 380.0e-9   # metres
   lambda_max: 700.0e-9   # metres
-  n_wavelengths: 11
+  n_wavelengths: 41
 
   # Spectral weights applied when summing monochromatic PSFs.
   # 'flat'  : uniform weights (equal energy per wavenumber interval)
@@ -99,7 +99,7 @@ atmosphere:
     wind_direction: 0.0  # radians
 
 simulation:
-  n_examples: 2500       # unique Zernike mirror states
+  n_examples: 256      # unique Zernike mirror states
   t_frames: 8           # frames per sequence pair
   frame_rate: 50.0       # Hz
 
