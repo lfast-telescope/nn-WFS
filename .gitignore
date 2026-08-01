@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+checkpoints/
+data/
+imgs/
+tmp/
