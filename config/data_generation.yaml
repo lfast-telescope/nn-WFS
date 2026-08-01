@@ -42,7 +42,7 @@ wavelengths:
   # Sampling is uniform in wavenumber (1/lambda) to give equal photon-energy spacing.
   lambda_min: 380.0e-9   # metres
   lambda_max: 700.0e-9   # metres
-  n_wavelengths: 41
+  n_wavelengths: 11
 
   # Spectral weights applied when summing monochromatic PSFs.
   # 'flat'  : uniform weights (equal energy per wavenumber interval)
@@ -99,7 +99,7 @@ atmosphere:
     wind_direction: 0.0  # radians
 
 simulation:
-  n_examples: 256      # unique Zernike mirror states
+  n_examples: 50000      # unique Zernike mirror states
   t_frames: 8           # frames per sequence pair
   frame_rate: 50.0       # Hz
 

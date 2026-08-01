@@ -40,7 +40,7 @@ from datetime import datetime, timedelta
 import h5py
 import numpy as np
 import yaml
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, gaussian_filter
 import matplotlib
 matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
@@ -561,17 +561,6 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
         for ex_idx in range(n_examples):
             start_time = time.time()
             labels_ex  = draw_coefficients(cfg, rng)
-            if True: #measured values for M10
-                from scipy.ndimage import gaussian_filter
-                labels_ex = np.array([ 0,  0,  0,  0.00357185,  0,
-                                       -0.00573468, -0.00146731,  0.0019003 , -0.00451308,  0.01534035,
-                                       -0.00153402,  0.00159377, -0.03138667,  0.00059039,  0.00120527,
-                                       -0.00099496, -0.00098309, -0.00525709, -0.00473997, -0.01460854,
-                                       -0.00064142,  0.00034417,  0.00068143, -0.00876478,  0.02190548,
-                                       0.00241134, -0.0015036 , -0.0010248 ,  0.00082468,  0.00108903,
-                                       0.00344091,  0.00198354,  0.00371751,  0.00064398,  0.00052905,
-                                       -0.00070846,  0.00024218, -0.00044527,  0.00135207,  0.00584624,
-                                       -0.00551072,  0.00388207,  0.00019439,  0.00066226,  0.00016089])[:36] * 1e-9
             
             mirror_opd = sum(float(c) * m for c, m in zip(labels_ex, zernike_basis))
 
@@ -592,12 +581,13 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
 
             tmpname = os.path.join(os.getcwd(),'tmp')
             avgsize = 3
-            R = (np.mean(I1m[:avgsize],0)-np.mean(I2m[:avgsize],0))/(np.mean(I1m[:avgsize],0)+np.mean(I2m[:avgsize],0))
+            R = (np.mean(I1m[:avgsize],0)-np.mean(I2m[:avgsize],0))/(np.mean(I1m[:avgsize],0)+np.mean(I2m[:avgsize],0)+1e-6)
             os.makedirs(tmpname, exist_ok=True)
             plt.imshow(gaussian_filter(R,1))
             plt.colorbar()
             plt.title(f"idx:{ex_idx} time: {time.time()-start_time}s")
             plt.savefig(os.path.join(tmpname,'debug_fig.png'))
+            plt.close()
 
             ds_psfs[row, 0]  = I1m.astype(np.float16)
             ds_psfs[row, 1]  = I2m.astype(np.float16)
