@@ -40,9 +40,12 @@ _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
-from dataset import CWFSDataset, train_val_test_split, compute_label_stats, get_n_modes
+from dataset import (
+    CWFSDataset, train_val_test_split, compute_label_stats,
+    GroupedBatchSampler,get_n_modes
+), 
 from models.transformer_cwfs import TransformerCWFS
-from models.cnn_cwfs import CNNCWFS
+from models.cnn_cwfs import SIAMCNN, RODCNN, CNNCWFS
 from models.toy_model import SLPCWFS
 from utils.augmentation import D4Augment
 from utils.metrics import per_mode_rms, total_wfe_rms, strehl_proxy
@@ -101,7 +104,7 @@ def build_model(cfg: dict) -> nn.Module:
     model_type = mc['type'].lower()
     kwargs = {k: v for k, v in mc.items() if k != 'type'}
 
-    registry = {'transformer': TransformerCWFS, 'cnn': CNNCWFS, 'toy': SLPCWFS}
+    registry = {'transformer': TransformerCWFS, 'cnn': SIAMCNN, 'toy': SLPCWFS, 'rodcnn': RODCNN}
     if model_type not in registry:
         raise ValueError(f"Unknown model type '{model_type}'. Choose from: {list(registry)}")
 
@@ -204,6 +207,10 @@ def _run_epoch(
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
         for batch_idx, batch in enumerate(loader):
+            # Extract inputs and labels from batch
+            I1 = batch['I1'].to(device, non_blocking=True)
+            I2 = batch['I2'].to(device, non_blocking=True)
+            r  = batch['r'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)   # z-scored
             
             # Truncate labels to subset if subset mode training
@@ -212,22 +219,36 @@ def _run_epoch(
 
             input_mode = getattr(model, 'input_mode', 'pairs')
             with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                if input_mode == 'two_stream':
-                    I1 = batch['I1'].to(device, non_blocking=True)
-                    I2 = batch['I2'].to(device, non_blocking=True)
-                    pred = model(I1, I2)
-                elif input_mode == 'r_stack':
-                    R = batch['R'].to(device, non_blocking=True)
-                    pred = model(R)                                        # [B*T², n_outputs]
-                    TT = pred.shape[0] // labels.shape[0]
-                    labels = labels.repeat_interleave(TT, dim=0)           # [B*T², n_modes]
-                else:  # 'pairs'
-                    I1 = batch['I1'].to(device, non_blocking=True)
-                    I2 = batch['I2'].to(device, non_blocking=True)
-                    r  = batch['r'].to(device, non_blocking=True)
-                    pred = model(I1, I2, r)
-                loss = criterion(pred, labels)
+                # Extract inputs and labels from batch
+                I1 = batch['I1'].to(device, non_blocking=True)
+                I2 = batch['I2'].to(device, non_blocking=True)
+                r  = batch['r'].to(device, non_blocking=True)
+                labels = batch['labels'].to(device, non_blocking=True)   # z-scored
 
+                # Truncate labels to subset if subset mode training
+                if n_outputs is not None:
+                    labels = labels[:, :n_outputs]
+
+                input_mode = getattr(model, 'input_mode', 'pairs')
+
+                with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
+                    if isinstance(model, RODCNN):
+                        # RODCNN: B² expansion + averaging, ignores input_mode
+                        pred_all = model(I1, I2)              # [B², n_outputs]
+                        pred     = pred_all.mean(dim=0)        # [n_outputs]
+                        loss     = criterion(pred, labels[0])  # labels[i] identical for all i
+                    elif input_mode == 'two_stream':
+                        pred = model(I1, I2)
+                        loss = criterion(pred, labels)
+                    elif input_mode == 'r_stack':
+                        R = batch['R'].to(device, non_blocking=True)
+                        pred = model(R)                        # [B*T², n_outputs]
+                        TT = pred.shape[0] // labels.shape[0]
+                        labels = labels.repeat_interleave(TT, dim=0)  # [B*T², n_modes]
+                        loss = criterion(pred, labels)
+                    else:  # 'pairs' (default)
+                        pred = model(I1, I2, r)
+                        loss = criterion(pred, labels)      
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
                 if scaler is not None:
@@ -245,8 +266,14 @@ def _run_epoch(
             total_loss += loss.item()
 
             # accumulate denormalised predictions for physical metrics
-            all_pred.append((pred.detach() * ls + lm).cpu())
-            all_target.append((labels.detach() * ls + lm).cpu())
+            lm = label_mean.to(device)
+            ls = label_std.to(device)
+            if isinstance(model, RODCNN):
+                all_pred.append((pred.detach().unsqueeze(0) * ls + lm).cpu())
+                all_target.append((labels[0:1].detach() * ls + lm).cpu())
+            else:
+                all_pred.append((pred.detach() * ls + lm).cpu())
+                all_target.append((labels.detach() * ls + lm).cpu())
 
             # Intermediate logging
             elapsed = time.time() - t0
@@ -353,14 +380,31 @@ def train(cfg: dict) -> None:
 
     n_workers = dc.get('num_workers', 4)
     batch_size = dc.get('batch_size', 64)
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size * 2, shuffle=False,
-        num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
-    )
+    if mc['type'].lower() == 'rodcnn':
+        group_size    = dc.get('group_size', batch_size)
+        train_sampler = GroupedBatchSampler(
+            train_idx, group_size, batch_size=batch_size, shuffle=True,
+        )
+        val_sampler   = GroupedBatchSampler(
+            val_idx, group_size, batch_size=batch_size, shuffle=False,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_sampler=train_sampler,
+            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+        )
+        val_loader = DataLoader(
+            val_ds, batch_sampler=val_sampler,
+            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size * 2, shuffle=False,
+            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+        )
 
     # ── model ─────────────────────────────────────────────────────────
     model = build_model(cfg).to(device)

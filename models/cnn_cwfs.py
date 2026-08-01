@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 
 try:
-    from .common import CrossAttentionBlock, MLPHead, encode_and_pool
+    from .common import CrossAttentionBlock, MLPHead, encode_and_pool, RoddierSignal
 except ImportError:
-    from models.common import CrossAttentionBlock, MLPHead, encode_and_pool
+    from models.common import CrossAttentionBlock, MLPHead, encode_and_pool, RoddierSignal
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -103,10 +103,10 @@ class ResNetBackbone(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# CNNCWFS
+# SIAMCNN (formerly CNNCWFS)
 # ──────────────────────────────────────────────────────────────────────
 
-class CNNCWFS(nn.Module):
+class SIAMCNN(nn.Module):
     """
     Siamese ResNet + cross-attention Curvature Wavefront Sensor network.
 
@@ -246,3 +246,110 @@ class CNNCWFS(nn.Module):
             return self._forward_two_stream(*args, **kwargs)
         else:
             return self._forward_r_stack(*args, **kwargs)
+
+
+# Backward-compatibility alias
+CNNCWFS = SIAMCNN
+
+
+# ──────────────────────────────────────────────────────────────────────
+# RODCNN — Cross-batch Roddier CNN
+# ──────────────────────────────────────────────────────────────────────
+
+class RODCNN(nn.Module):
+    """
+    Cross-batch Roddier CNN for curvature wavefront sensing.
+
+    Architecture
+    ------------
+    Input: B intra-focal images (I1) and B extra-focal images (I2), all drawn
+    from the same mirror state (same Zernike label) with independent atmospheric
+    realisations.  Requires GroupedBatchSampler so every batch is same-state.
+
+    B² expansion (inside forward):
+        All B×B combinations of (I1_i, I2_j) are formed, yielding B² Roddier
+        signals  r_ij = (I1_i − I2_j) / (I1_i + I2_j + ε).
+
+    Single-stream backbone (no cross-attention):
+        r_all [B², 1, H, W] → ResNetBackbone → [B², C, Hp, Wp]
+        → flatten → [B², N, C] → global average pool → [B², C]
+        → MLPHead → [B², n_outputs]
+
+    Training objective:
+        Loss on pred.mean(dim=0) vs labels[0].  Training the mean of B²
+        predictions forces the network to extract the invariant mirror
+        wavefront while averaging out diverse atmospheric realisations.
+
+    Parameters
+    ----------
+    base_ch      : int   — ResNet stem output channels (default 32)
+    stage_blocks : int   — BasicBlocks per stage (default 2)
+    dropout      : float — dropout probability in regression head
+    n_outputs    : int   — number of Zernike coefficients to predict (default 14)
+    """
+
+    def __init__(
+        self,
+        base_ch: int = 32,
+        stage_blocks: int = 2,
+        dropout: float = 0.0,
+        n_outputs: int = 14,
+    ):
+        super().__init__()
+        self.n_outputs = n_outputs
+        self.roddier   = RoddierSignal()
+        self.backbone  = ResNetBackbone(base_ch=base_ch, stage_blocks=stage_blocks)
+        dim            = self.backbone.out_channels
+        self.head      = MLPHead(dim, [dim // 2], n_outputs, dropout)
+
+    def forward(
+        self,
+        I1: torch.Tensor,
+        I2: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        I1 : Tensor[B, 1, H, W]  — intra-focal mean PSFs (same mirror state)
+        I2 : Tensor[B, 1, H, W]  — extra-focal mean PSFs (same mirror state)
+
+        Returns
+        -------
+        Tensor[B², n_outputs]  — one prediction per (I1_i, I2_j) combination
+        """
+        B, C, H, W = I1.shape
+        # Vectorised B² expansion: pair every I1_i with every I2_j
+        I1_rep = I1.unsqueeze(1).expand(B, B, C, H, W).reshape(B * B, C, H, W)
+        I2_rep = I2.unsqueeze(0).expand(B, B, C, H, W).reshape(B * B, C, H, W)
+        r_all  = self.roddier(I1_rep, I2_rep)              # [B², 1, H, W]
+
+        feat           = self.backbone(r_all)              # [B², dim, Hp, Wp]
+        B2, ch, Hp, Wp = feat.shape
+        tokens         = feat.view(B2, ch, Hp * Wp).transpose(1, 2)  # [B², N, ch]
+        pooled         = tokens.mean(dim=1)                           # [B², ch]
+        return self.head(pooled)                                       # [B², n_outputs]
+
+    def predict(
+        self,
+        I1: torch.Tensor,
+        I2: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Inference helper: average predictions over the I2 axis per I1 query.
+
+        For each I1_i, Roddier signals are computed against all B available
+        I2_j and the mean prediction is returned — averaging out atmospheric
+        noise.  With B=1 (single matched pair) reduces to standard inference.
+
+        Parameters
+        ----------
+        I1 : Tensor[B, 1, H, W]
+        I2 : Tensor[B, 1, H, W]
+
+        Returns
+        -------
+        Tensor[B, n_outputs]  — one averaged prediction per I1 query
+        """
+        B   = I1.shape[0]
+        raw = self.forward(I1, I2)                              # [B², n_outputs]
+        return raw.reshape(B, B, self.n_outputs).mean(dim=1)   # [B, n_outputs]
