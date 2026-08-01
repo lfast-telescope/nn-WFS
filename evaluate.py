@@ -42,6 +42,7 @@ sys.path.insert(0, str(_HERE.parent))
 
 from dataset import CWFSDataset, train_val_test_split
 from train import build_model, NOLL_NAMES
+from models.cnn_cwfs import RODCNN
 from utils.metrics import per_mode_rms, total_wfe_rms, strehl_proxy
 
 
@@ -118,12 +119,18 @@ def _predict(
             r      = batch['r'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
 
-            if zero_r:
-                r = torch.zeros_like(r)
+            if isinstance(model, RODCNN):
+                pred_all   = model(I1, I2)                       # [B², n_outputs]
+                pred       = pred_all.mean(dim=0, keepdim=True)  # [1, n_outputs]
+                labels_eff = labels[0:1]
+            else:
+                if zero_r:
+                    r = torch.zeros_like(r)
+                pred       = model(I1, I2, r)                    # [B, n_outputs]
+                labels_eff = labels
 
-            pred = model(I1, I2, r)                  # always z-scored outputs
-            pred_phys = pred * ls + lm
-            target_phys = labels * ls + lm if labels_are_zscored else labels
+            pred_phys   = pred * ls + lm
+            target_phys = labels_eff * ls + lm if labels_are_zscored else labels_eff
 
             all_pred.append(pred_phys.cpu())
             all_target.append(target_phys.cpu())

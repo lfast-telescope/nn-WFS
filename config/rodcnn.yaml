@@ -1,0 +1,34 @@
+model:
+  type: rodcnn
+  base_ch: 32             # stem channels; stages scale to 64→128→256→256
+  stage_blocks: 2         # BasicBlocks per ResNet stage
+  dropout: 0.1
+  n_outputs: 14
+
+data:
+  hdf5_path: null         # override on the command line: --hdf5_path /path/to/data.h5
+  split_ratios: [0.80, 0.10, 0.10]
+  split_seed: 42
+  # batch_size: number of same-mirror-state examples drawn per batch.
+  # group_size: consecutive rows in the HDF5 file that share the same mirror
+  #   state (same Zernike label, independently evolved atmosphere each row).
+  #   GroupedBatchSampler uses group_size to locate same-state rows.
+  #   Set group_size = batch_size if each mirror state spans exactly batch_size
+  #   consecutive rows; set larger if you want to sub-sample within a group.
+  batch_size: 8
+  group_size: 8
+  num_workers: 4
+  augment: true
+
+training:
+  epochs: 50
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+  warmup_steps: 500
+  grad_clip: 1.0
+  amp: true
+
+logging:
+  checkpoint_dir: checkpoints/rodcnn
+  log_interval: 100
+  save_top_k: 3

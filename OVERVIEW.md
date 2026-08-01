@@ -30,7 +30,8 @@ fixed at ΔW = 4.5 × 545 nm.
 
 ```
 nn_CWFS/
-├── make_training_data.py   — synthetic PSF generation (hcipy; stub, deferred)
+├── make_training_data.py   — synthetic PSF generation (hcipy; Fraunhofer propagator, polychromatic)
+├── run_sky_defocus.py      — on-sky intra/extra-focal image alignment and Roddier signal (OpenCV)
 ├── dataset.py              — lazy HDF5 data loading, train/val/test split
 ├── utils/
 │   ├── augmentation.py     — D4 dihedral symmetry augmentation
@@ -41,7 +42,8 @@ nn_CWFS/
 │   └── cnn_cwfs.py         — Siamese ResNet-CWFS architecture
 ├── config/
 │   ├── transformer.yaml    — hyperparameter config for TransformerCWFS
-│   └── cnn.yaml            — hyperparameter config for CNNCWFS
+│   ├── cnn.yaml            — hyperparameter config for CNNCWFS
+│   └── data_generation.yaml — optics, wavelength, Zernike, and simulation parameters
 ├── train.py                — unified training loop (both model types)
 └── evaluate.py             — evaluation, model comparison, ablation, fine-tuning
 ```
@@ -210,14 +212,31 @@ adapting to real PSF statistics.
 
 | Item | Notes |
 |------|-------|
-| `make_training_data.py` | Stub; hcipy Fraunhofer propagator, 35-wavelength polychromatic, atmospheric layers, 32-frame temporal stacks |
 | `--resume` in `train.py` | Not implemented; needed before long runs |
 | PSF flux normalisation | Currently deferred to LN/BN; explicit `sum=1` normalisation in `dataset.py` may improve cross-condition stability |
+| `run_sky_defocus.py` paths | Script currently has hardcoded paths to `paper/intra.png` and `paper/extra.png`; needs CLI argument support |
 | Integration with `WavefrontSensor` ABC | `evaluate.py` is standalone; on-sky pipeline integration with `shared/base_classes.py` not yet implemented |
 
 ---
 
 ## Usage
+
+```bash
+# Generate synthetic training data
+python make_training_data.py --config config/data_generation.yaml --output data/cwfs_synthetic.h5
+
+# Dry-run (validate config without writing data)
+python make_training_data.py --config config/data_generation.yaml --dry-run
+
+# Override config values at the command line
+python make_training_data.py --config config/data_generation.yaml \
+    --simulation.n_examples=500 --output data/small.h5
+```
+
+```bash
+# Align on-sky intra/extra-focal images and compute Roddier signal
+python run_sky_defocus.py
+```
 
 ```bash
 # Train TransformerCWFS

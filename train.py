@@ -39,9 +39,12 @@ _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
-from dataset import CWFSDataset, train_val_test_split, compute_label_stats
+from dataset import (
+    CWFSDataset, train_val_test_split, compute_label_stats,
+    GroupedBatchSampler,
+)
 from models.transformer_cwfs import TransformerCWFS
-from models.cnn_cwfs import CNNCWFS
+from models.cnn_cwfs import SIAMCNN, RODCNN, CNNCWFS
 from utils.augmentation import D4Augment
 from utils.metrics import per_mode_rms, total_wfe_rms, strehl_proxy
 
@@ -103,9 +106,13 @@ def build_model(cfg: dict) -> nn.Module:
     if model_type == 'transformer':
         return TransformerCWFS(**kwargs)
     elif model_type == 'cnn':
-        return CNNCWFS(**kwargs)
+        return SIAMCNN(**kwargs)
+    elif model_type == 'rodcnn':
+        return RODCNN(**kwargs)
     else:
-        raise ValueError(f"Unknown model type '{model_type}'. Choose 'transformer' or 'cnn'.")
+        raise ValueError(
+            f"Unknown model type '{model_type}'. Choose 'transformer', 'cnn', or 'rodcnn'."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -197,8 +204,13 @@ def _run_epoch(
             labels = batch['labels'].to(device, non_blocking=True)   # z-scored
 
             with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                pred = model(I1, I2, r)
-                loss = criterion(pred, labels)
+                if isinstance(model, RODCNN):
+                    pred_all = model(I1, I2)              # [B², n_outputs]
+                    pred     = pred_all.mean(dim=0)        # [n_outputs]
+                    loss     = criterion(pred, labels[0]) # labels[i] identical for all i
+                else:
+                    pred = model(I1, I2, r)               # [B, n_outputs]
+                    loss = criterion(pred, labels)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -219,8 +231,12 @@ def _run_epoch(
             # accumulate denormalised predictions for physical metrics
             lm = label_mean.to(device)
             ls = label_std.to(device)
-            all_pred.append((pred.detach() * ls + lm).cpu())
-            all_target.append((labels.detach() * ls + lm).cpu())
+            if isinstance(model, RODCNN):
+                all_pred.append((pred.detach().unsqueeze(0) * ls + lm).cpu())
+                all_target.append((labels[0:1].detach() * ls + lm).cpu())
+            else:
+                all_pred.append((pred.detach() * ls + lm).cpu())
+                all_target.append((labels.detach() * ls + lm).cpu())
 
             if is_train and log_interval > 0 and (batch_idx + 1) % log_interval == 0:
                 elapsed = time.time() - t0
@@ -297,14 +313,31 @@ def train(cfg: dict) -> None:
 
     n_workers = dc.get('num_workers', 4)
     batch_size = dc.get('batch_size', 128)
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size * 2, shuffle=False,
-        num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
-    )
+    if mc['type'].lower() == 'rodcnn':
+        group_size    = dc.get('group_size', batch_size)
+        train_sampler = GroupedBatchSampler(
+            train_idx, group_size, batch_size=batch_size, shuffle=True,
+        )
+        val_sampler   = GroupedBatchSampler(
+            val_idx, group_size, batch_size=batch_size, shuffle=False,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_sampler=train_sampler,
+            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+        )
+        val_loader = DataLoader(
+            val_ds, batch_sampler=val_sampler,
+            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size * 2, shuffle=False,
+            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+        )
 
     # ── model ─────────────────────────────────────────────────────────
     model = build_model(cfg).to(device)
