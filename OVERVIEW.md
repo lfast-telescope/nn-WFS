@@ -30,8 +30,7 @@ fixed at ΔW = 4.5 × 545 nm.
 
 ```
 nn_CWFS/
-├── make_training_data.py   — synthetic PSF generation (hcipy; Fraunhofer propagator, polychromatic)
-├── run_sky_defocus.py      — on-sky intra/extra-focal image alignment and Roddier signal (OpenCV)
+├── make_training_data.py   — synthetic PSF generation with hcipy
 ├── dataset.py              — lazy HDF5 data loading, train/val/test split
 ├── utils/
 │   ├── augmentation.py     — D4 dihedral symmetry augmentation
@@ -39,9 +38,11 @@ nn_CWFS/
 ├── models/
 │   ├── common.py           — shared building blocks (PatchEmbed, attention blocks, MLP head)
 │   ├── transformer_cwfs.py — Transformer-CWFS architecture
-│   └── cnn_cwfs.py         — Siamese ResNet-CWFS architecture
+│   ├── cnn_cwfs.py         — Siamese ResNet-CWFS architecture
+|   └── toy_model.py
 ├── config/
 │   ├── transformer.yaml    — hyperparameter config for TransformerCWFS
+│   ├── toy_model.yaml    — hyperparameter config for toy_model
 │   ├── cnn.yaml            — hyperparameter config for CNNCWFS
 │   └── data_generation.yaml — optics, wavelength, Zernike, and simulation parameters
 ├── train.py                — unified training loop (both model types)

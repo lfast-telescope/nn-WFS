@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 
 try:
-    from .common import CrossAttentionBlock, MLPHead, RoddierSignal
+    from .common import CrossAttentionBlock, MLPHead, encode_and_pool, RoddierSignal
 except ImportError:
-    from models.common import CrossAttentionBlock, MLPHead, RoddierSignal
+    from models.common import CrossAttentionBlock, MLPHead, encode_and_pool, RoddierSignal
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -132,11 +132,13 @@ class SIAMCNN(nn.Module):
     ----------
     base_ch        : int   — ResNet stem output channels (default 32)
     stage_blocks   : int   — BasicBlocks per stage (default 2)
-    n_cross_blocks : int   — cross-attention blocks (default 2; minimum 2)
+    n_cross_blocks : int   — cross-attention blocks (default 2; minimum 1 for
+                             two_stream/pairs, 0 allowed for r_stack)
     n_heads        : int   — attention heads; out_channels must be divisible by n_heads
     ffn_mult       : int   — FFN hidden-dim multiplier in cross-attention blocks
     dropout        : float — dropout probability
     n_outputs      : int   — number of Zernike coefficients (default 14)
+    input_mode     : str   — 'two_stream' (default) | 'r_stack' | 'pairs'
     """
 
     def __init__(
@@ -148,10 +150,14 @@ class SIAMCNN(nn.Module):
         ffn_mult: int = 4,
         dropout: float = 0.0,
         n_outputs: int = 14,
+        input_mode: str = 'two_stream',
     ):
         super().__init__()
-        if n_cross_blocks < 2:
-            raise ValueError("n_cross_blocks must be at least 2")
+        if input_mode not in ('two_stream', 'r_stack', 'pairs'):
+            raise ValueError(f"Unknown input_mode '{input_mode}'")
+        if input_mode in ('pairs', 'two_stream') and n_cross_blocks < 1:
+            raise ValueError("n_cross_blocks must be at least 1")
+        self.input_mode = input_mode
 
         # Shared Siamese backbone
         self.backbone = ResNetBackbone(base_ch=base_ch, stage_blocks=stage_blocks)
@@ -189,36 +195,57 @@ class SIAMCNN(nn.Module):
         B, C, Hp, Wp = feat.shape
         return feat.view(B, C, Hp * Wp).transpose(1, 2)   # [B, N, C]
 
-    def forward(
+    def _encode_and_pool(self, frames: torch.Tensor) -> torch.Tensor:
+        """frames: [B, T, H, W] → per-frame backbone + mean pool → [B, N, C]"""
+        return encode_and_pool(frames, self._extract)
+
+    def _forward_pairs(
         self,
         I1: torch.Tensor,
         I2: torch.Tensor,
-        r: torch.Tensor,
+        r:  torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        I1 : Tensor[B, 1, H, W]  — intra-focal mean PSF
-        I2 : Tensor[B, 1, H, W]  — extra-focal mean PSF
-        r  : Tensor[B, 1, H, W]  — Roddier normalised-difference signal
-
-        Returns
-        -------
-        Tensor[B, n_outputs]  — predicted Zernike coefficients Z2..Z15
-        """
-        F1 = self._extract(I1)   # [B, N, C]
+        # I1, I2, r: [B, 1, H, W]
+        F1 = self._extract(I1)
         F2 = self._extract(I2)
         Fr = self._extract(r)
-
-        # Cross-attention cascade (same pattern as TransformerCWFS)
         kv_sources = [F2, Fr]
         q = F1
         for k, cross_block in enumerate(self.cross_attn):
-            kv = kv_sources[min(k, 1)]
+            kv = kv_sources[k % 2]   # even k → F2; odd k → Fr
             q = cross_block(q, kv)
+        return self.head(q.mean(dim=1))
 
-        pooled = q.mean(dim=1)   # [B, C]
-        return self.head(pooled)
+    def _forward_two_stream(
+        self,
+        I1: torch.Tensor,
+        I2: torch.Tensor,
+    ) -> torch.Tensor:
+        # I1, I2: [B, T, H, W]
+        F1 = self._encode_and_pool(I1)   # [B, N, C]
+        F2 = self._encode_and_pool(I2)   # [B, N, C]
+        q = F1
+        for cross_block in self.cross_attn:
+            q = cross_block(q, F2)       # all blocks use F2 as kv
+        return self.head(q.mean(dim=1))
+
+    def _forward_r_stack(
+        self,
+        R: torch.Tensor,
+    ) -> torch.Tensor:
+        # R: [B, T², H, W] — each frame is an independent sample
+        B, TT, H, W = R.shape
+        flat = R.reshape(B * TT, 1, H, W)     # [B*T², 1, H, W]
+        tokens = self._extract(flat)           # [B*T², N, C]
+        return self.head(tokens.mean(dim=1))   # [B*T², n_outputs]
+
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        if self.input_mode == 'pairs':
+            return self._forward_pairs(*args, **kwargs)
+        elif self.input_mode == 'two_stream':
+            return self._forward_two_stream(*args, **kwargs)
+        else:
+            return self._forward_r_stack(*args, **kwargs)
 
 
 # Backward-compatibility alias

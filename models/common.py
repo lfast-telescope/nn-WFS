@@ -260,3 +260,30 @@ class MLPHead(nn.Module):
         Tensor[B, out_dim]
         """
         return self.net(x)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Temporal frame aggregation
+# ──────────────────────────────────────────────────────────────────────
+
+def encode_and_pool(frames: torch.Tensor, backbone_fn) -> torch.Tensor:
+    """
+    Process each frame of a temporal stack independently through backbone_fn,
+    then mean-pool over the frame dimension.
+
+    Parameters
+    ----------
+    frames      : Tensor[B, T, H, W]
+    backbone_fn : callable  Tensor[B*T, 1, H, W] → Tensor[B*T, N, D]
+                  Both _extract (CNNCWFS) and _encode (TransformerCWFS) satisfy
+                  this contract.
+
+    Returns
+    -------
+    Tensor[B, N, D]
+    """
+    B, T, H, W = frames.shape
+    flat  = frames.reshape(B * T, 1, H, W)
+    feats = backbone_fn(flat)                          # [B*T, N, D]
+    N, D  = feats.shape[1], feats.shape[2]
+    return feats.reshape(B, T, N, D).mean(dim=1)       # [B, N, D]

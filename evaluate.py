@@ -40,7 +40,7 @@ _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
-from dataset import CWFSDataset, train_val_test_split
+from dataset import CWFSDataset, train_val_test_split, get_n_modes
 from train import build_model, NOLL_NAMES
 from models.cnn_cwfs import RODCNN
 from utils.metrics import per_mode_rms, total_wfe_rms, strehl_proxy
@@ -495,6 +495,16 @@ if __name__ == '__main__':
     if args.compare:
         if not (args.ckpt_transformer and args.ckpt_cnn and args.hdf5_path):
             raise ValueError("--compare requires --ckpt_transformer, --ckpt_cnn, --hdf5_path")
+        n_modes_hdf5 = get_n_modes(args.hdf5_path)
+        for ckpt_name, ckpt_path in [('ckpt_transformer', args.ckpt_transformer),
+                                     ('ckpt_cnn', args.ckpt_cnn)]:
+            _, _meta = load_checkpoint(ckpt_path, device)
+            n_out = _meta['config']['model'].get('n_outputs')
+            if n_out is not None and n_modes_hdf5 != n_out:
+                raise ValueError(
+                    f"n_modes mismatch: HDF5 has {n_modes_hdf5} label columns but "
+                    f"{ckpt_name} model.n_outputs={n_out}."
+                )
         # raw-label loader so each model uses its own normalisation stats
         test_loader = make_test_loader(args.hdf5_path, label_stats=None,
                                        batch_size=args.batch_size,
@@ -512,6 +522,14 @@ if __name__ == '__main__':
     label_stats = {'mean': lm, 'std': ls}
 
     if args.hdf5_path:
+        n_modes_hdf5  = get_n_modes(args.hdf5_path)
+        n_outputs_ckpt = meta['config']['model'].get('n_outputs')
+        if n_outputs_ckpt is not None and n_modes_hdf5 != n_outputs_ckpt:
+            raise ValueError(
+                f"n_modes mismatch: HDF5 has {n_modes_hdf5} label columns but "
+                f"checkpoint model.n_outputs={n_outputs_ckpt}.  "
+                f"Ensure the checkpoint and dataset were produced with the same n_modes."
+            )
         test_loader = make_test_loader(args.hdf5_path, label_stats=label_stats,
                                        batch_size=args.batch_size,
                                        num_workers=args.num_workers)

@@ -1,3 +1,4 @@
+#%%
 """
 make_training_data.py — Synthetic CWFS Training Data Generator
 
@@ -12,8 +13,9 @@ PSF size on a real detector with fixed pixel pitch.
 
 Output HDF5 schema
 ------------------
-psfs   : float16  [N, 2, H, W]   channel 0 = I1 (intra-focal), 1 = I2 (extra-focal)
-labels : float32  [N, n_modes]   Zernike coefficients Z2..Z(n_modes+1), metres OPD
+psfs   : float16  [N, 2, T, H, W]  channel 0 = I1 (intra-focal), 1 = I2 (extra-focal)
+labels : float32  [N, n_modes]     Zernike coefficients Z1..Z{n_modes}, metres OPD
+                                    indices 0–2 (Z1 piston, Z2 tip, Z3 tilt) are always zero
 Attributes on 'labels': label_units = 'metres_opd'
 
 Usage
@@ -34,11 +36,14 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-
+from datetime import datetime, timedelta
 import h5py
 import numpy as np
 import yaml
 from scipy.ndimage import zoom
+import matplotlib
+matplotlib.use('QtAgg')
+import matplotlib.pyplot as plt
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
@@ -57,7 +62,9 @@ try:
         make_obstructed_circular_aperture,
         make_pupil_grid,
         make_zernike_basis,
+        imshow_field
     )
+    from hcipy.atmosphere import Cn_squared_from_fried_parameter
 except ImportError as e:
     sys.exit(
         f"hcipy is required to generate training data.  "
@@ -74,7 +81,7 @@ except ImportError:
             yield x
         print()
 
-
+#%%
 # ──────────────────────────────────────────────────────────────────────────────
 # Config loading
 # ──────────────────────────────────────────────────────────────────────────────
@@ -140,7 +147,7 @@ def make_wavelength_grid(cfg: _NS):
     scheme = str(cfg.wavelengths.weights).lower()
     if scheme != 'flat':
         print(f"Warning: unknown weight scheme '{scheme}', falling back to flat.")
-    weights = np.ones(n, dtype=np.float14)
+    weights = np.ones(n, dtype=np.float64)
     weights /= weights.sum()
     return wavelengths, weights
 
@@ -189,8 +196,8 @@ def build_optics(cfg: _NS):
     basis_3      = make_zernike_basis(3, OD, pupil_grid, starting_mode=2)
     defocus_mode = np.array(basis_3[2])          # shape (N_pupil²,)
 
-    # c4 = delta_z / (8 * (f/#)² * sqrt(3))   [metres OPD, Noll convention]
-    c4_defocus = delta_z / (8.0 * focal_ratio**2 * math.sqrt(3))
+    # c4 = delta_z / (16 * (f/#)² * sqrt(3))   [metres OPD, Noll convention]
+    c4_defocus = delta_z / (16.0 * focal_ratio**2 * math.sqrt(3))
 
     return pupil_grid, focal_grid, prop, aperture, defocus_mode, c4_defocus, focal_length
 
@@ -198,15 +205,15 @@ def build_optics(cfg: _NS):
 def build_zernike_basis(cfg: _NS, pupil_grid):
     """
     Return list of n_modes hcipy Zernike modes as ndarrays on pupil_grid.
-    Modes are Z2..Z(n_modes+1) in Noll ordering (piston Z1 excluded).
+    Modes are Z1..Z{n_modes} in Noll ordering (includes piston Z1).
     """
     n_modes = cfg.zernike.n_modes
-    basis   = make_zernike_basis(n_modes, cfg.optics.OD, pupil_grid, starting_mode=2)
+    basis   = make_zernike_basis(n_modes, cfg.optics.OD, pupil_grid, starting_mode=1)
     modes   = [np.array(b) for b in basis]
 
-    print(f"  Zernike basis: {n_modes} modes Z2–Z{n_modes+1}, "
-          f"mode[0] (tip) peak={modes[0].max():.3f}, "
-          f"mode[2] (defocus) peak={modes[2].max():.3f}")
+    print(f"  Zernike basis: {n_modes} modes Z1–Z{n_modes}, "
+          f"mode[0] (tip) peak={modes[1].max():.3f}, "
+          f"mode[2] (defocus) peak={modes[3].max():.3f}")
     return modes
 
 
@@ -214,42 +221,55 @@ def build_zernike_basis(cfg: _NS, pupil_grid):
 # Zernike coefficient sampling
 # ──────────────────────────────────────────────────────────────────────────────
 
-def make_amplitude_array(cfg: _NS) -> np.ndarray:
-    """Return per-mode RMS amplitudes in metres OPD, shape (n_modes,)."""
-    n        = cfg.zernike.n_modes
-    override = cfg.zernike.per_mode_rms_nm
+def _noll_radial_order(j: int) -> int:
+    """Return the radial order n for Noll index j (1-based)."""
+    return int(math.ceil((-3.0 + math.sqrt(1.0 + 8.0 * j)) / 2.0))
+
+
+def draw_coefficients(cfg: _NS, rng: np.random.Generator) -> np.ndarray:
+    """
+    Draw one set of Zernike coefficients in metres OPD, shape (n_modes,).
+
+    Builds per-mode amplitudes from config (honouring amplitude_normalization
+    and per_mode_rms_nm), then samples from the requested distribution.
+    Modes 0–2 (Z2–Z4, tip/tilt/piston equivalents) are zeroed after drawing.
+    """
+    n             = cfg.zernike.n_modes
+    distribution  = cfg.zernike.distribution
+    normalization = str(cfg.zernike.get('amplitude_normalization', 'none')).lower()
+    override      = cfg.zernike.per_mode_rms_nm
 
     if override is not None:
-        arr = np.asarray(override, dtype=np.float64) * 1e-9
-        if len(arr) != n:
+        amplitudes = np.asarray(override, dtype=np.float64) * 1e-9
+        if len(amplitudes) != n:
             raise ValueError(
-                f"per_mode_rms_nm has {len(arr)} entries but n_modes={n}"
+                f"per_mode_rms_nm has {len(amplitudes)} entries but n_modes={n}"
             )
-        return arr
+    else:
+        scalar = cfg.zernike.amplitude_rms   # metres
+        amplitudes = np.full(n, scalar, dtype=np.float64)
+        if normalization == 'radial_order':
+            # Z1 (piston) has radial order 0; clamp to 1 since its coeff is always zeroed.
+            radial_orders = np.array(
+                [max(1, _noll_radial_order(j)) for j in range(1, n + 1)],
+                dtype=np.float64,
+            )
+            amplitudes = amplitudes / radial_orders
+        elif normalization != 'none':
+            raise ValueError(
+                f"Unknown amplitude_normalization '{normalization}'. "
+                "Use 'none' or 'radial_order'."
+            )
 
-    scalar = cfg.zernike.amplitude_rms   # metres
-    return np.full(n, scalar, dtype=np.float64)
-
-
-def draw_coefficients(amplitudes: np.ndarray, distribution: str,
-                      rng: np.random.Generator) -> np.ndarray:
-    """
-    Draw one set of Zernike coefficients in metres OPD.
-
-    Parameters
-    ----------
-    amplitudes   : ndarray[n_modes]  — per-mode RMS in metres
-    distribution : 'gaussian' | 'uniform'
-    rng          : numpy Generator
-    """
-    n = len(amplitudes)
     if distribution == 'gaussian':
-        return rng.standard_normal(n) * amplitudes
+        dist = rng.standard_normal(n) * amplitudes
     elif distribution == 'uniform':
         half = amplitudes * math.sqrt(3)
-        return rng.uniform(-half, half)
+        dist = rng.uniform(-half, half)
     else:
         raise ValueError(f"Unknown distribution '{distribution}'. Use 'gaussian' or 'uniform'.")
+    dist[:3] = 0  # Don't train for first three modes
+    return dist
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -267,16 +287,12 @@ def build_atmosphere(cfg: _NS, pupil_grid, seed: int):
     wl_r = cfg.optics.wavelength_ref
 
     if cfg.atmosphere.use_las_campanas:
-        # hcipy's Las Campanas profile does not expose per-layer seeds;
-        # seed numpy's legacy random state as a workaround for reproducibility.
-        np.random.seed(seed)
+        cn_squared = Cn_squared_from_fried_parameter(r0, wl_r)
         layers = make_las_campanas_atmospheric_layers(
             pupil_grid,
-            r0=r0,
-            L0=cfg.atmosphere.L0,
-            wavelength=wl_r,
+            cn_squared=cn_squared,
+            outer_scale=cfg.atmosphere.L0,
         )
-        np.random.seed(None)          # restore to non-deterministic
         atm = MultiLayerAtmosphere(layers, scintillation=False)
     else:
         sl    = cfg.atmosphere.single_layer
@@ -289,6 +305,15 @@ def build_atmosphere(cfg: _NS, pupil_grid, seed: int):
         atm = MultiLayerAtmosphere([layer], scintillation=False)
 
     atm.t = 0.0
+    return atm
+
+def reset_atm_seed(atm):
+    """Advance each layer to a new independent realization and reset t to 0."""
+    if atm is None:
+        return None
+    for layer in atm.layers:
+        layer.reset(make_independent_realization=True)
+    atm._t = 0.0
     return atm
 
 
@@ -331,58 +356,89 @@ def propagate_polychromatic(
     defocus_sign: float,
     defocus_opd:  np.ndarray,
     c4_defocus:   float,
-    atm_opd,
+    cfg:          _NS,
     aperture:     np.ndarray,
     prop:         FraunhoferPropagator,
     pupil_grid,
     wavelengths:  np.ndarray,
     weights:      np.ndarray,
-    wl_ref:       float,
     img_size:     int,
+    atm,
 ) -> np.ndarray:
     """
     Propagate a polychromatic wavefront to the focal plane.
 
-    Option B: propagate each wavelength on the fixed λ_ref/D grid, zoom
-    each PSF by (λ / λ_ref) to convert to physical pixel scale, then sum.
+    Simulates a long exposure as n_frames sequential frames at the configured
+    frame rate.  Each frame is the average of n_sub atmospheric samples spaced
+    by one coherence time tau_0 = 0.31 * r0 / v_wind.  The atmosphere is
+    advanced monotonically through time via atm.t assignment (hcipy evolve_until).
+
+    The caller must call reset_atm_seed(atm) before each call so that I1 and I2
+    start from independent atmospheric realizations.
 
     Returns broadband PSF (img_size, img_size), normalised to unit total flux.
     """
-    broadband = np.zeros((img_size, img_size), dtype=np.float64)
+    wl_ref   = cfg.optics.wavelength_ref
+    n_frames = cfg.simulation.t_frames
+    t_frame  = 1.0 / cfg.simulation.frame_rate
+    pixel_oversample = cfg.optics.pixel_oversample
+    raw_size = img_size * pixel_oversample
 
-    total_opd = mirror_opd + defocus_sign * c4_defocus * defocus_opd
-    if atm_opd is not None:
-        total_opd = total_opd + atm_opd
+    tau_0 = None
+    if cfg.atmosphere.enabled and atm is not None:
+        v_wind = cfg.atmosphere.single_layer.wind_speed
+        tau_0  = 0.31 * cfg.atmosphere.r0_500nm / v_wind
+
+    n_sub   = max(1, round(t_frame / tau_0)) if tau_0 is not None else 1
+    n_total = n_frames * n_sub
+
+    static_opd = mirror_opd + defocus_sign * c4_defocus * defocus_opd
+    broadband = np.zeros((raw_size, raw_size), dtype=np.float64)
+    broadband_t_integrated = broadband.copy()
+    frames    = np.zeros((n_frames, raw_size, raw_size), dtype=np.float64)
 
     # Ngrid_foc: focal grid side length, derived from the propagated field size
-    # (NOT the pupil grid size — they differ: pupil has pupil_samples², focal
-    # has (2*num_airy*q)² ≈ 384² for q=8, num_airy=24).
+    # (NOT the pupil grid size — they differ
     Ngrid_foc = None
 
-    for wl, wt in zip(wavelengths, weights):
-        phase     = (2.0 * math.pi / wl) * total_opd
-        amplitude = aperture * np.exp(1j * phase)
-        wf        = Wavefront(Field(amplitude.astype(np.complex128), pupil_grid), wl)
-        psf_field = prop.forward(wf).power
-        if Ngrid_foc is None:
-            Ngrid_foc = int(round(math.sqrt(len(psf_field))))
-        psf_2d    = np.array(psf_field).reshape(Ngrid_foc, Ngrid_foc)
+    for frame_i in range(n_frames):
+        for sub_j in range(n_sub):
+            t_sample  = frame_i * t_frame + sub_j * tau_0 if tau_0 is not None else 0.0
+            atm_opd   = get_atm_opd(atm, t_sample, wl_ref) if atm is not None else None
+            total_opd = static_opd + atm_opd if atm_opd is not None else static_opd
 
-        scale = wl / wl_ref
-        if abs(scale - 1.0) < 1e-9:
-            psf_phys = psf_2d
-        else:
-            psf_phys = zoom(psf_2d, scale, order=3, mode='constant', cval=0.0)
+            for wl, wt in zip(wavelengths, weights):
+                phase     = (2.0 * math.pi / wl) * total_opd
+                amplitude = aperture * np.exp(1j * phase)
+                wf        = Wavefront(Field(amplitude.astype(np.complex128), pupil_grid), wl)
+                psf_field = prop.forward(wf).power
+                if Ngrid_foc is None:
+                    Ngrid_foc = int(round(math.sqrt(len(psf_field))))
+                psf_2d    = np.array(psf_field).reshape(Ngrid_foc, Ngrid_foc)
+                scale = wl / wl_ref
+                if abs(scale - 1.0) < 1e-9:
+                    psf_phys = psf_2d
+                else:
+                    psf_phys = zoom(psf_2d, scale, order=3, mode='constant', cval=0.0)
+                broadband += wt * _centre_crop_or_pad(psf_phys, raw_size)
+            broadband_t_integrated += broadband
+            broadband = broadband*0
 
-        broadband += wt * _centre_crop_or_pad(psf_phys, img_size)
+        frames[frame_i] = broadband_t_integrated
+        broadband_t_integrated = broadband_t_integrated*0        
 
-    total = broadband.sum()
+    # Bin pixel_oversample × pixel_oversample sub-pixels into detector pixels:
+    # frames (n_frames, raw_size, raw_size) → binned_frames (n_frames, img_size, img_size)
+    binned_frames = frames.reshape(
+        n_frames, img_size, pixel_oversample, img_size, pixel_oversample
+    ).mean(axis=(2, 4))
+    total = binned_frames.sum()
     if total > 0:
-        broadband /= total
+        binned_frames /= total
 
-    return broadband
+    return binned_frames
 
-
+#%%
 # ──────────────────────────────────────────────────────────────────────────────
 # Main generation loop
 # ──────────────────────────────────────────────────────────────────────────────
@@ -391,14 +447,21 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
     """
     Generate the full synthetic dataset and write to HDF5.
     """
-    out_path    = Path(output_path or cfg.output.path)
     n_examples  = cfg.simulation.n_examples
-    n_atm_seeds = cfg.simulation.n_atm_seeds
-    n_total     = n_examples * n_atm_seeds
+    n_total     = n_examples
+    t_frames    = cfg.simulation.t_frames
     img_size    = cfg.simulation.img_size
     n_modes     = cfg.zernike.n_modes
     chunk       = cfg.simulation.hdf5_chunk_size
     seed_base   = cfg.simulation.random_seed
+
+    if output_path is None:
+        timestamp = datetime.now().strftime("%H%M%S")
+        base = Path(cfg.output.path)
+        out_path = base.parent / f"{base.stem}_{n_examples}ex_{t_frames}fr{base.suffix}"
+
+    else:
+        out_path = Path(output_path)
 
     if dry_run:
         n_total = 2
@@ -416,42 +479,52 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
 
     print("Building Zernike basis...")
     zernike_basis = build_zernike_basis(cfg, pupil_grid)
-    amplitudes    = make_amplitude_array(cfg)
     wavelengths, weights = make_wavelength_grid(cfg)
     rng = np.random.default_rng(seed_base)
 
+    print("Building atmosphere...")
+    atm = build_atmosphere(cfg, pupil_grid, seed=seed_base)
+
     print(f"  {len(wavelengths)} wavelengths "
           f"[{wavelengths.min()*1e9:.0f}–{wavelengths.max()*1e9:.0f}] nm")
-    print(f"  {n_modes} modes, amplitude RMS "
-          f"[{amplitudes.min()*1e9:.0f}–{amplitudes.max()*1e9:.0f}] nm")
+    print(f"  {n_modes} modes, amplitude_rms={cfg.zernike.amplitude_rms*1e9:.0f} nm "
+          f"(normalization={cfg.zernike.get('amplitude_normalization', 'none')})")
 
     # ── Dry run ──────────────────────────────────────────────────────────────
     if dry_run:
-        for i in range(n_total):
-            atm_seed = seed_base + i
-            atm      = build_atmosphere(cfg, pupil_grid, seed=atm_seed)
-            labels   = draw_coefficients(amplitudes, cfg.zernike.distribution, rng)
+        for i in range(t_frames):
+            labels     = draw_coefficients(cfg, rng)
             mirror_opd = sum(float(c) * m for c, m in zip(labels, zernike_basis))
 
-            I1_acc = np.zeros((img_size, img_size))
-            I2_acc = np.zeros((img_size, img_size))
-            dt = 1.0 / cfg.simulation.frame_rate
-            for k in range(cfg.simulation.t_frames):
-                atm_opd = get_atm_opd(atm, k * dt, cfg.optics.wavelength_ref)
-                I1_acc += propagate_polychromatic(
-                    mirror_opd, +1.0, defocus_opd_unit, c4_defocus,
-                    atm_opd, aperture, prop, pupil_grid,
-                    wavelengths, weights, cfg.optics.wavelength_ref, img_size,
-                )
-                I2_acc += propagate_polychromatic(
-                    mirror_opd, -1.0, defocus_opd_unit, c4_defocus,
-                    atm_opd, aperture, prop, pupil_grid,
-                    wavelengths, weights, cfg.optics.wavelength_ref, img_size,
-                )
-            I1 = (I1_acc / cfg.simulation.t_frames).astype(np.float16)
-            I2 = (I2_acc / cfg.simulation.t_frames).astype(np.float16)
-            print(f"  Example {i}: I1 {I1.shape} sum={float(I1.astype(np.float32).sum()):.4f}  "
-                  f"labels [{labels.min()*1e9:.1f}..{labels.max()*1e9:.1f}] nm OPD")
+            atm = reset_atm_seed(atm)
+            I1 = propagate_polychromatic(
+                mirror_opd, +1.0, defocus_opd_unit, c4_defocus,
+                cfg, aperture, prop, pupil_grid,
+                wavelengths, weights, img_size,
+                atm,
+            )
+            atm = reset_atm_seed(atm)
+            I2 = propagate_polychromatic(
+                mirror_opd, -1.0, defocus_opd_unit, c4_defocus,
+                cfg, aperture, prop, pupil_grid,
+                wavelengths, weights, img_size,
+                atm,
+            )
+            fig, ax = plt.subplots(1, 3)
+            I1m, I2m = I1.mean(axis=0), I2.mean(axis=0)
+            I2m = np.rot90(I2m,k=2) #Roddier, yo!
+            S = (I2m - I1m)/(I2m + I1m)
+
+            if False:
+                ax[0].imshow(I1m)
+                ax[1].imshow(I2m)
+                ax[2].imshow((I1m - I2m) / (I1m + I2m + 1e-12))
+                plt.suptitle(f"c4={c4_defocus*1e9:.1f} nm")
+                fname = f"rot_150nm_1as_c4_{c4_defocus*1e9:.0f}nm.png"
+                plt.savefig('imgs/' + fname, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                print(f"    Saved {fname}")
+   
         print("Dry run complete.")
         return
 
@@ -459,12 +532,15 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"\nWriting {n_total} examples to {out_path} ...")
 
+    if chunk > n_total/2:
+        chunk = max(1,n_total/4)
+
     with h5py.File(out_path, 'w') as f:
         ds_psfs = f.create_dataset(
             'psfs',
-            shape=(n_total, 2, img_size, img_size),
+            shape=(n_total, 2, t_frames, img_size, img_size),
             dtype='float16',
-            chunks=(chunk, 2, img_size, img_size),
+            chunks=(chunk, 2, t_frames, img_size, img_size),
             compression='gzip', compression_opts=4,
         )
         ds_labels = f.create_dataset(
@@ -474,54 +550,75 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
             chunks=(chunk, n_modes),
         )
         ds_labels.attrs['label_units'] = cfg.output.label_units
-        ds_labels.attrs['noll_start']  = 2
+        ds_labels.attrs['noll_start']  = 1
         ds_labels.attrs['n_modes']     = n_modes
         f.attrs['config'] = json.dumps(dict(cfg), default=str)
 
         row = 0
         t0  = time.time()
-        dt  = 1.0 / cfg.simulation.frame_rate
+        last_time = time.time()
 
         for ex_idx in range(n_examples):
-            labels_ex  = draw_coefficients(amplitudes, cfg.zernike.distribution, rng)
+            start_time = time.time()
+            labels_ex  = draw_coefficients(cfg, rng)
+            if True: #measured values for M10
+                from scipy.ndimage import gaussian_filter
+                labels_ex = np.array([ 0,  0,  0,  0.00357185,  0,
+                                       -0.00573468, -0.00146731,  0.0019003 , -0.00451308,  0.01534035,
+                                       -0.00153402,  0.00159377, -0.03138667,  0.00059039,  0.00120527,
+                                       -0.00099496, -0.00098309, -0.00525709, -0.00473997, -0.01460854,
+                                       -0.00064142,  0.00034417,  0.00068143, -0.00876478,  0.02190548,
+                                       0.00241134, -0.0015036 , -0.0010248 ,  0.00082468,  0.00108903,
+                                       0.00344091,  0.00198354,  0.00371751,  0.00064398,  0.00052905,
+                                       -0.00070846,  0.00024218, -0.00044527,  0.00135207,  0.00584624,
+                                       -0.00551072,  0.00388207,  0.00019439,  0.00066226,  0.00016089])[:36] * 1e-9
+            
             mirror_opd = sum(float(c) * m for c, m in zip(labels_ex, zernike_basis))
 
-            for seed_offset in range(n_atm_seeds):
-                atm_seed = seed_base + ex_idx * n_atm_seeds + seed_offset
-                atm      = build_atmosphere(cfg, pupil_grid, seed=atm_seed)
+            atm = reset_atm_seed(atm)
+            I1m = propagate_polychromatic(
+                mirror_opd, +1.0, defocus_opd_unit, c4_defocus,
+                cfg, aperture, prop, pupil_grid,
+                wavelengths, weights, img_size,
+                atm,
+            )
+            atm = reset_atm_seed(atm)
+            I2m = np.rot90(propagate_polychromatic(
+                mirror_opd, -1.0, defocus_opd_unit, c4_defocus,
+                cfg, aperture, prop, pupil_grid,
+                wavelengths, weights, img_size,
+                atm,
+            ), k=2)
 
-                I1_acc = np.zeros((img_size, img_size), dtype=np.float64)
-                I2_acc = np.zeros((img_size, img_size), dtype=np.float64)
+            tmpname = os.path.join(os.getcwd(),'tmp')
+            avgsize = 3
+            R = (np.mean(I1m[:avgsize],0)-np.mean(I2m[:avgsize],0))/(np.mean(I1m[:avgsize],0)+np.mean(I2m[:avgsize],0))
+            os.makedirs(tmpname, exist_ok=True)
+            plt.imshow(gaussian_filter(R,1))
+            plt.colorbar()
+            plt.title(f"idx:{ex_idx} time: {time.time()-start_time}s")
+            plt.savefig(os.path.join(tmpname,'debug_fig.png'))
 
-                for k in range(cfg.simulation.t_frames):
-                    atm_opd = get_atm_opd(atm, k * dt, cfg.optics.wavelength_ref)
-                    I1_acc += propagate_polychromatic(
-                        mirror_opd, +1.0, defocus_opd_unit, c4_defocus,
-                        atm_opd, aperture, prop, pupil_grid,
-                        wavelengths, weights, cfg.optics.wavelength_ref, img_size,
-                    )
-                    I2_acc += propagate_polychromatic(
-                        mirror_opd, -1.0, defocus_opd_unit, c4_defocus,
-                        atm_opd, aperture, prop, pupil_grid,
-                        wavelengths, weights, cfg.optics.wavelength_ref, img_size,
-                    )
+            ds_psfs[row, 0]  = I1m.astype(np.float16)
+            ds_psfs[row, 1]  = I2m.astype(np.float16)
+            ds_labels[row]   = labels_ex.astype(np.float32)
+            row += 1
+            f.flush()
 
-                ds_psfs[row, 0] = (I1_acc / cfg.simulation.t_frames).astype(np.float16)
-                ds_psfs[row, 1] = (I2_acc / cfg.simulation.t_frames).astype(np.float16)
-                ds_labels[row]  = labels_ex.astype(np.float32)
-                row += 1
-
-            if (ex_idx + 1) % max(1, n_examples // 20) == 0 or ex_idx == n_examples - 1:
+            if (ex_idx % 2) == 0 or ex_idx == n_examples - 1:
                 elapsed = time.time() - t0
+                interval = time.time() - last_time
+                last_time = time.time()
                 done    = row
                 rate    = done / elapsed if elapsed > 0 else 0
-                eta     = (n_total - done) / rate if rate > 0 else float('inf')
+                eta_seconds     = (n_total - done) / rate if rate > 0 else float('inf')
+                eta_td  = timedelta(seconds=int(eta_seconds))
                 print(f"  [{done:>{len(str(n_total))}}/{n_total}]  "
-                      f"{elapsed:.0f}s  {rate:.2f} ex/s  ETA {eta:.0f}s")
+                    f"{int(elapsed):>5}s  {interval:5.1f}s  {rate:.2f} ex/s  ETA {str(eta_td)}")
 
-    print(f"\nDone.  HDF5: {out_path}")
-    print(f"  psfs   {ds_psfs.shape}   float16")
-    print(f"  labels {ds_labels.shape} float32")
+        print(f"\nDone.  HDF5: {out_path}")
+        print(f"  {'psfs':<8} {str(ds_psfs.shape):<18} float16")
+        print(f"  {'labels':<8} {str(ds_labels.shape):<18} float32")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

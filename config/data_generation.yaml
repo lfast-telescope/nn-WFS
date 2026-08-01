@@ -11,7 +11,7 @@ optics:
   # Sign convention: I1 = intra-focal (+delta_z), I2 = extra-focal (-delta_z).
   # delta_z drives c4 = delta_z / (16 * focal_ratio^2 * sqrt(3))  [metres OPD]
   # WARNING: confirm against LFAST optical design before full-scale generation.
-  delta_z: 1.4e-3        # axial defocus distance per camera, metres
+  delta_z: 0.369e-3        # axial defocus distance per camera, metres
 
   # Focal plane sampling.
   # q   : pixels per lambda/D at the reference wavelength.
@@ -21,8 +21,14 @@ optics:
   #            blur radius ~ delta_z / (8*(f/#)^2 * lambda/D) in lambda/D.
   #            Set large enough that < 1% of broadband flux is clipped at
   #            the longest wavelength.  Verify empirically with check_grid_extent.
-  q: 4
-  num_airy: 24
+  # Currently: match with 4x oversampled pixels on LFAST ZWO ASI183 cam
+  q: 3.025
+  num_airy: 138 #valid+faster but doesn't make sense why this is <169.25-subtense on cam
+
+  # Sub-pixel oversampling factor.  The focal grid is sampled at
+  # (img_size * pixel_oversample)^2 and binned to img_size^2 after
+  # accumulation, ensuring Nyquist sampling of lambda/D is maintained.
+  pixel_oversample: 4
 
   # Pupil grid resolution (samples across diameter).
   pupil_samples: 256
@@ -34,9 +40,9 @@ optics:
 wavelengths:
   # Polychromatic bandpass.
   # Sampling is uniform in wavenumber (1/lambda) to give equal photon-energy spacing.
-  lambda_min: 400.0e-9   # metres
+  lambda_min: 380.0e-9   # metres
   lambda_max: 700.0e-9   # metres
-  n_wavelengths: 35
+  n_wavelengths: 41
 
   # Spectral weights applied when summing monochromatic PSFs.
   # 'flat'  : uniform weights (equal energy per wavenumber interval)
@@ -47,15 +53,23 @@ zernike:
   # Number of Zernike modes in the mirror phase screen (Noll ordering).
   # Modes Z2..Z(2+n_modes-1) are used.  n_modes=14 covers Z2–Z15.
   # Must match the n_outputs in the model configs (currently 14).
-  n_modes: 14
+  n_modes: 36
 
   # RMS amplitude of each drawn coefficient, metres OPD.
   # Can be a scalar (same for all modes) or a list of length n_modes.
   # 100 nm ≈ typical residual mirror error in the relevant Zernike band.
-  amplitude_rms: 100.0e-9
+  amplitude_rms: 125.0e-9
 
   # Coefficient sampling distribution: 'gaussian' or 'uniform'
   distribution: gaussian
+
+  # Per-mode amplitude normalization applied to the scalar amplitude_rms.
+  # Ignored when per_mode_rms_nm is set.
+  #   'none'         - all modes share the same amplitude_rms (default)
+  #   'radial_order' - amplitude for mode with Noll radial order n = amplitude_rms / n
+  #                    (lower-order modes get larger amplitudes, matching the
+  #                    qualitative shape of mirror error spectra)
+  amplitude_normalization: 'radial_order'
 
   # Optional per-mode RMS override list (length must equal n_modes).
   # If null, amplitude_rms scalar is used for all modes.
@@ -64,17 +78,17 @@ zernike:
   # per_mode_rms_nm: [200, 200, 80, 80, 80, 60, 60, 60, 60, 50, 50, 50, 50, 50]
 
 atmosphere:
-  enabled: false
+  enabled: true
 
   # Use hcipy's Las Campanas (LCO) multi-layer turbulence profile.
   # If false, a single-layer Kolmogorov screen is used instead.
   use_las_campanas: true
 
   # Fried parameter at 500 nm (metres). Typical values:
-  #   good seeing:    r0 = 0.20 m   (1 arcsec at 500 nm)
-  #   median seeing:  r0 = 0.12 m   (1.7 arcsec)
-  #   poor seeing:    r0 = 0.06 m   (3.4 arcsec)
-  r0_500nm: 0.12
+  #   good seeing:    r0 = 0.20 m  
+  #   median seeing:  r0 = 0.12 m   
+  #   poor seeing:    r0 = 0.06 m   
+  r0_500nm: 0.10
   L0: 25.0               # outer scale for Las Campanas profile, metres
 
   # Single-layer fallback (used only when use_las_campanas: false)
@@ -85,10 +99,8 @@ atmosphere:
     wind_direction: 0.0  # radians
 
 simulation:
-  n_examples: 1000       # unique Zernike mirror states
-  n_atm_seeds: 1         # independent atmosphere seeds per mirror state
-                         # total rows in HDF5 = n_examples * n_atm_seeds
-  t_frames: 32           # frames per mean-pooled image pair
+  n_examples: 256      # unique Zernike mirror states
+  t_frames: 8           # frames per sequence pair
   frame_rate: 50.0       # Hz
 
   # Final PSF image size written to HDF5 [img_size x img_size].
