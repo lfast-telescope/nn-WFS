@@ -120,6 +120,7 @@ def _lr_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
     if step < warmup_steps:
         return float(step) / max(1, warmup_steps)
     progress = float(step - warmup_steps) / max(1, total_steps - warmup_steps)
+    progress = min(progress, 1.0)
     return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
@@ -186,11 +187,18 @@ def _run_epoch(
         0-based label-column indices selecting/ordering `label_mean`/`label_std`
         to match the (already column-selected) labels returned by the dataset.
         If None, use all columns from labels.
+    accumulate_every : int
+        Number of consecutive batches/examples to accumulate gradients over
+        before each optimizer step.  1 (default) steps every batch, matching
+        prior behaviour for all non-RODCNN models.  For RODCNN, the loader
+        yields one example per iteration (see `train()`), so this is the
+        gradient-accumulation window in "examples per optimizer step".
     Loss
     ----
     L2 (MSE) on z-scored Zernike labels.  Physical-unit metrics (WFE rms, Strehl proxy)
     are computed after denormalising predictions.
     """
+    is_rodcnn = model_type.lower() == 'rodcnn'
     model.train(is_train)
     criterion = nn.MSELoss()
 
@@ -224,17 +232,10 @@ def _run_epoch(
             else:
                 I1 = batch['I1'].to(device, non_blocking=True)
                 I2 = batch['I2'].to(device, non_blocking=True)
-                r  = batch['r'].to(device, non_blocking=True)
                 labels = batch['labels'].to(device, non_blocking=True)   # z-scored
                 input_mode = getattr(model, 'input_mode', 'pairs')
-
                 with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                    if isinstance(model, RODCNN):
-                        # RODCNN: B² expansion + averaging, ignores input_mode
-                        pred_all = model(I1, I2)              # [B², n_outputs]
-                        pred     = pred_all.mean(dim=0)        # [n_outputs]
-                        loss     = criterion(pred, labels[0])  # labels[i] identical for all i
-                    elif input_mode == 'two_stream':
+                    if input_mode == 'two_stream':
                         pred = model(I1, I2)
                         loss = criterion(pred, labels)
                     elif input_mode == 'r_stack':
@@ -244,22 +245,29 @@ def _run_epoch(
                         labels = labels.repeat_interleave(TT, dim=0)  # [B*T², n_modes]
                         loss = criterion(pred, labels)
                     else:  # 'pairs' (default)
+                        r  = batch['r'].to(device, non_blocking=True)
                         pred = model(I1, I2, r)
-                        loss = criterion(pred, labels)      
+                        loss = criterion(pred, labels)
+
+            is_last_in_window = ((batch_idx + 1) % accumulate_every == 0) or (batch_idx + 1 == len(loader))
             if is_train:
                 if scaler is not None:
                     scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
                 else:
                     loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    optimizer.step()
-                scheduler.step()
+                if is_last_in_window:
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                        optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
-            total_loss += loss.item()
+            total_loss += loss.item() * accumulate_every
 
             # accumulate denormalised predictions for physical metrics
             if is_rodcnn:
@@ -390,8 +398,10 @@ def train(cfg: dict) -> None:
     label_std  = torch.from_numpy(stats['std'])
 
     # ── datasets & loaders ────────────────────────────────────────────
-    return_stacks = dc.get('return_stacks', False)
-    augment = D4Augment() if dc.get('augment', True) and not return_stacks else None
+    is_rodcnn = mc['type'].lower() == 'rodcnn'
+    # RODCNN always consumes per-example T-frame stacks (see Phase 4 batching below).
+    return_stacks = True if is_rodcnn else dc.get('return_stacks', False)
+    augment = D4Augment(trained_modes) if dc.get('augment', True) else None
     train_ds = CWFSDataset(hdf5_path, train_idx, label_stats=stats, transform=augment,
                            return_stacks=return_stacks,
                            mode_columns=mode_columns if subset_mode else None)
@@ -448,11 +458,13 @@ def train(cfg: dict) -> None:
     )
     epochs       = tc['epochs']
     warmup_steps = tc.get('warmup_steps', 500)
-    total_steps  = epochs * len(train_loader)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda s: _lr_lambda(s, warmup_steps, total_steps),
-    )
+    steps_per_epoch = math.ceil(len(train_loader) / batch_size) if is_rodcnn else len(train_loader)
+    total_steps  = epochs * steps_per_epoch
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(
+    #     optimizer,
+    #     lr_lambda=lambda s: _lr_lambda(s, warmup_steps, total_steps),
+    # )
+    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0)
 
     use_amp = tc.get('amp', True) and device.type == 'cuda'
     scaler  = torch.amp.GradScaler('cuda') if use_amp else None

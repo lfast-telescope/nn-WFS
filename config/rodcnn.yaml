@@ -13,7 +13,6 @@ data:
   # accumulation window).  Each example is one HDF5 row, batched internally
   # over its T temporal frames (T² Roddier pairs) by the model itself.
   batch_size: 8
-  group_size: 8
   num_workers: 4
   augment: true
 
@@ -24,8 +23,14 @@ training:
   warmup_steps: 500
   grad_clip: 1.0
   amp: true
+  # 'reduce-overhead' uses CUDA graphs, which reuse static output buffers and
+  # are incompatible with RODCNN's per-example gradient-accumulation loop
+  # (each accumulation-window forward/backward call needs its own live
+  # buffer). Use 'default' instead to still get torch.compile's fusion
+  # benefits without CUDA graph capture.
+  compile_mode: default
 
 logging:
   checkpoint_dir: checkpoints/rodcnn
-  log_interval: 100
+  log_interval: 1
   save_top_k: 3
