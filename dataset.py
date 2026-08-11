@@ -59,14 +59,22 @@ class CWFSDataset(Dataset):
         If True: 1 item per example, returns
         {I1:[T,H,W], I2:[T,H,W], R:[T²,H,W], labels}.
         Required for input_mode='two_stream' or 'r_stack'.
+    mode_columns : array-like of int or None
+        If set, 0-based HDF5 label-column indices to select (subset mode
+        training), in the given order — e.g. [4,5,6,7,8,9,10,11,12,13,14]
+        selects Noll modes Z5..Z15.  Selection occurs after z-score
+        normalisation but before the augmentation transform, ensuring
+        D4Augment operates on correctly-sized, correctly-ordered labels.
     """
 
-    def __init__(self, hdf5_path, indices, label_stats=None, transform=None, return_stacks=False):
+    def __init__(self, hdf5_path, indices, label_stats=None, transform=None, return_stacks=False, mode_columns=None):
         self.path = str(hdf5_path)
         self.indices = np.asarray(indices, dtype=np.int64)
         self.label_stats = label_stats
         self.transform = transform
         self.return_stacks = return_stacks
+        # if set, select (and reorder) these 0-based label columns before augmentation
+        self.mode_idx = torch.as_tensor(mode_columns, dtype=torch.long) if mode_columns is not None else None
         self._file = None          # opened lazily; one handle per DataLoader worker
 
         # Detect schema and store T (frames per stream).
@@ -126,7 +134,13 @@ class CWFSDataset(Dataset):
                 mean = torch.as_tensor(self.label_stats['mean'], dtype=torch.float32)
                 std  = torch.as_tensor(self.label_stats['std'],  dtype=torch.float32)
                 labels = (labels - mean) / (std + 1e-8)
-            return {'I1': I1, 'I2': I2, 'R': R, 'labels': labels}
+            # Select mode columns if specified (subset mode)
+            if self.mode_idx is not None:
+                labels = labels[self.mode_idx]
+            sample = {'I1': I1, 'I2': I2, 'R': R, 'labels': labels}
+            if self.transform is not None:
+                sample = self.transform(sample)
+            return sample
 
         # ── pair-expansion mode: T² items per example ──
         if self._temporal:
@@ -156,6 +170,10 @@ class CWFSDataset(Dataset):
             mean = torch.as_tensor(self.label_stats['mean'], dtype=torch.float32)
             std  = torch.as_tensor(self.label_stats['std'],  dtype=torch.float32)
             labels = (labels - mean) / (std + 1e-8)
+
+        # Select mode columns if specified (subset mode) — before augmentation
+        if self.mode_idx is not None:
+            labels = labels[self.mode_idx]
 
         sample = {'I1': I1, 'I2': I2, 'r': r, 'labels': labels}
 

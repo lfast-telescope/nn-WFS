@@ -3,7 +3,7 @@ model:
   base_ch: 32             # stem channels; stages scale to 64→128→256→256
   stage_blocks: 2         # BasicBlocks per ResNet stage
   dropout: 0.1
-  n_outputs: 14
+  trained_modes: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
 data:
   hdf5_path: null         # override on the command line: --hdf5_path /path/to/data.h5

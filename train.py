@@ -46,7 +46,7 @@ from dataset import (
 from models.transformer_cwfs import TransformerCWFS
 from models.cnn_cwfs import SIAMCNN, RODCNN, CNNCWFS
 from models.toy_model import SLPCWFS
-from utils.augmentation import D4Augment
+from utils.augmentation import D4Augment, validate_trained_modes_pairing
 from utils.metrics import per_mode_rms, total_wfe_rms, strehl_proxy
 
 # ─────────────────────────────────────────────────────────────────────
@@ -170,7 +170,9 @@ def _run_epoch(
     grad_clip: float,
     log_interval: int,
     is_train: bool,
-    n_outputs: int = None,
+    mode_idx: torch.Tensor = None,
+    model_type: str = 'cnn',
+    accumulate_every: int = 1,
 ) -> dict:
     """
     Run one epoch.  Returns a dict of scalar metrics.
@@ -180,8 +182,9 @@ def _run_epoch(
     no gradient computation.
     Parameters
     ----------
-    n_outputs : int, optional
-        If set, truncate labels to first n_outputs columns (subset mode training).
+    mode_idx : Tensor, optional
+        0-based label-column indices selecting/ordering `label_mean`/`label_std`
+        to match the (already column-selected) labels returned by the dataset.
         If None, use all columns from labels.
     Loss
     ----
@@ -195,39 +198,34 @@ def _run_epoch(
     all_pred   = []
     all_target = []
     t0 = time.time()
-    
-    # Prepare label stats for subset mode if needed
+
+    # Prepare label stats, selecting the same columns/order as the dataset
     lm = label_mean.to(device)
     ls = label_std.to(device)
-    if n_outputs is not None:
-        lm = lm[:n_outputs]
-        ls = ls[:n_outputs]
+    if mode_idx is not None:
+        lm = lm[mode_idx]
+        ls = ls[mode_idx]
+
+    if is_train:
+        optimizer.zero_grad(set_to_none=True)
 
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
         for batch_idx, batch in enumerate(loader):
-            # Extract inputs and labels from batch
-            I1 = batch['I1'].to(device, non_blocking=True)
-            I2 = batch['I2'].to(device, non_blocking=True)
-            r  = batch['r'].to(device, non_blocking=True)
-            labels = batch['labels'].to(device, non_blocking=True)   # z-scored
-            
-            # Truncate labels to subset if subset mode training
-            if n_outputs is not None:
-                labels = labels[:, :n_outputs]
-
-            input_mode = getattr(model, 'input_mode', 'pairs')
-            with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                # Extract inputs and labels from batch
+            if is_rodcnn:
+                # One example per iteration: I1/I2 are [T,H,W] (see train()).
+                I1 = batch['I1'].to(device, non_blocking=True).unsqueeze(1)  # [T,1,H,W]
+                I2 = batch['I2'].to(device, non_blocking=True).unsqueeze(1)  # [T,1,H,W]
+                labels = batch['labels'].to(device, non_blocking=True)      # [n_outputs]
+                with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
+                    pred_all = model(I1, I2)              # [T², n_outputs]
+                    pred     = pred_all.mean(dim=0)        # [n_outputs]
+                    loss     = criterion(pred, labels) / accumulate_every
+            else:
                 I1 = batch['I1'].to(device, non_blocking=True)
                 I2 = batch['I2'].to(device, non_blocking=True)
                 r  = batch['r'].to(device, non_blocking=True)
                 labels = batch['labels'].to(device, non_blocking=True)   # z-scored
-
-                # Truncate labels to subset if subset mode training
-                if n_outputs is not None:
-                    labels = labels[:, :n_outputs]
-
                 input_mode = getattr(model, 'input_mode', 'pairs')
 
                 with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
@@ -249,7 +247,6 @@ def _run_epoch(
                         pred = model(I1, I2, r)
                         loss = criterion(pred, labels)      
             if is_train:
-                optimizer.zero_grad(set_to_none=True)
                 if scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -265,11 +262,9 @@ def _run_epoch(
             total_loss += loss.item()
 
             # accumulate denormalised predictions for physical metrics
-            lm = label_mean.to(device)
-            ls = label_std.to(device)
-            if isinstance(model, RODCNN):
+            if is_rodcnn:
                 all_pred.append((pred.detach().unsqueeze(0) * ls + lm).cpu())
-                all_target.append((labels[0:1].detach() * ls + lm).cpu())
+                all_target.append((labels.detach().unsqueeze(0) * ls + lm).cpu())
             else:
                 all_pred.append((pred.detach() * ls + lm).cpu())
                 all_target.append((labels.detach() * ls + lm).cpu())
@@ -310,15 +305,23 @@ def _run_epoch(
 # Main training loop
 # ─────────────────────────────────────────────────────────────────────
 
-NOLL_NAMES = [
-    'Z2 (x-tilt)', 'Z3 (y-tilt)', 'Z4 (defocus)',
-    'Z5 (obl-astig)', 'Z6 (vert-astig)',
-    'Z7 (vert-coma)', 'Z8 (horiz-coma)',
-    'Z9 (vert-trefoil)', 'Z10 (obl-trefoil)',
-    'Z11 (spherical)',
-    'Z12 (2nd-vert-astig)', 'Z13 (2nd-obl-astig)',
-    'Z14', 'Z15',
-]
+NOLL_MODE_NAMES = {
+    2: 'Z2 (x-tilt)', 3: 'Z3 (y-tilt)', 4: 'Z4 (defocus)',
+    5: 'Z5 (obl-astig)', 6: 'Z6 (vert-astig)',
+    7: 'Z7 (vert-coma)', 8: 'Z8 (horiz-coma)',
+    9: 'Z9 (vert-trefoil)', 10: 'Z10 (obl-trefoil)',
+    11: 'Z11 (spherical)',
+    12: 'Z12 (2nd-vert-astig)', 13: 'Z13 (2nd-obl-astig)',
+    14: 'Z14', 15: 'Z15',
+}
+
+
+def _format_mode_list(trained_modes: list[int]) -> str:
+    """Pretty-print a Noll mode list, collapsing contiguous runs to Z{a}-Z{b}."""
+    is_contiguous = trained_modes == list(range(trained_modes[0], trained_modes[-1] + 1))
+    if is_contiguous and len(trained_modes) > 1:
+        return f"Z{trained_modes[0]}–Z{trained_modes[-1]}"
+    return ",".join(f"Z{m}" for m in trained_modes)
 
 
 def train(cfg: dict) -> None:
@@ -338,22 +341,39 @@ def train(cfg: dict) -> None:
     if not hdf5_path:
         raise ValueError("data.hdf5_path must be set in config or via --hdf5_path")
 
-    n_modes_hdf5  = get_n_modes(hdf5_path)
-    n_outputs_cfg = mc.get('n_outputs', None)
-    if n_outputs_cfg is None:
-        raise ValueError("model.n_outputs must be set in the model config.")
-    if n_outputs_cfg > n_modes_hdf5:
+    n_modes_hdf5 = get_n_modes(hdf5_path)
+    trained_modes = mc.get('trained_modes')
+    if trained_modes is None:
         raise ValueError(
-            f"n_outputs mismatch: model requests {n_outputs_cfg} modes but "
-            f"HDF5 only has {n_modes_hdf5} label columns.  "
-            f"Either reduce model.n_outputs or use a dataset with more modes."
+            "model.trained_modes must be set in the model config, e.g. "
+            "trained_modes: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]."
         )
-    
+    trained_modes = list(trained_modes)
+    if len(trained_modes) == 0:
+        raise ValueError("model.trained_modes must be a non-empty list of Noll indices.")
+    if len(set(trained_modes)) != len(trained_modes):
+        raise ValueError(f"model.trained_modes contains duplicate entries: {trained_modes}")
+    if trained_modes != sorted(trained_modes):
+        raise ValueError(f"model.trained_modes must be strictly ascending, got {trained_modes}")
+    if trained_modes[0] < 1 or trained_modes[-1] > n_modes_hdf5:
+        raise ValueError(
+            f"model.trained_modes must be Noll indices in [1, {n_modes_hdf5}] "
+            f"(HDF5 has {n_modes_hdf5} label columns); got {trained_modes}"
+        )
+    # Pairing-completeness is a hard requirement of the model, checked
+    # unconditionally regardless of whether augmentation is enabled.
+    validate_trained_modes_pairing(trained_modes)
+
+    mode_columns = [m - 1 for m in trained_modes]   # 0-based HDF5 column indices
+    mode_idx     = torch.as_tensor(mode_columns, dtype=torch.long)
+    n_outputs    = len(trained_modes)
+    mc['n_outputs'] = n_outputs   # derived value consumed by build_model()
+
     # Subset mode: training on fewer modes than available in HDF5
-    subset_mode = n_outputs_cfg < n_modes_hdf5
+    subset_mode = n_outputs < n_modes_hdf5
     if subset_mode:
-        print(f"\nSubset mode: training on Z2–Z{n_outputs_cfg+1} ({n_outputs_cfg} modes) "
-              f"from HDF5 with {n_modes_hdf5} available modes")
+        print(f"\nSubset mode: training on {_format_mode_list(trained_modes)} "
+              f"({n_outputs} modes) from HDF5 with {n_modes_hdf5} available modes")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -373,9 +393,11 @@ def train(cfg: dict) -> None:
     return_stacks = dc.get('return_stacks', False)
     augment = D4Augment() if dc.get('augment', True) and not return_stacks else None
     train_ds = CWFSDataset(hdf5_path, train_idx, label_stats=stats, transform=augment,
-                           return_stacks=return_stacks)
+                           return_stacks=return_stacks,
+                           mode_columns=mode_columns if subset_mode else None)
     val_ds   = CWFSDataset(hdf5_path, val_idx,   label_stats=stats,
-                           return_stacks=return_stacks)
+                           return_stacks=return_stacks,
+                           mode_columns=mode_columns if subset_mode else None)
 
     n_workers = dc.get('num_workers', 4)
     batch_size = dc.get('batch_size', 64)
@@ -449,14 +471,18 @@ def train(cfg: dict) -> None:
     eff_bs = batch_size * (T * T if input_mode == 'r_stack' else 1)
     print(f"\n{'─'*60}")
     print(f"  Model        {mc['type']}  ({n_params:.2f}M params)")
-    print(f"  Input mode   {input_mode}")
-    print(f"  Temporal T   {T}  \u2192  {T*T} Roddier combinations/example")
-    if input_mode == 'r_stack':
-        print(f"  Batch size   {batch_size}  (effective {eff_bs} after T\u00b2 expansion)")
+    if is_rodcnn:
+        print(f"  Batching     per-example T-frame stacks (T={T} → {T*T} Roddier pairs/example)")
+        print(f"  Accumulation {batch_size} examples/optimizer-step")
     else:
-        print(f"  Batch size   {batch_size}")
+        print(f"  Input mode   {input_mode}")
+        print(f"  Temporal T   {T}  \u2192  {T*T} Roddier combinations/example")
+        if input_mode == 'r_stack':
+            print(f"  Batch size   {batch_size}  (effective {eff_bs} after T\u00b2 expansion)")
+        else:
+            print(f"  Batch size   {batch_size}")
     if subset_mode:
-        print(f"  n_modes      {n_outputs_cfg} (trained on Z2–Z{n_outputs_cfg+1}) / {n_modes_hdf5} available")
+        print(f"  n_modes      {n_outputs} (trained on {_format_mode_list(trained_modes)}) / {n_modes_hdf5} available")
     else:
         print(f"  n_modes      {n_modes_hdf5}")
     print(f"  Device       {device}")
@@ -490,7 +516,9 @@ def train(cfg: dict) -> None:
             grad_clip=tc.get('grad_clip', 1.0),
             log_interval=lc.get('log_interval', 100),
             is_train=True,
-            n_outputs=n_outputs_cfg if subset_mode else None,
+            mode_idx=mode_idx if subset_mode else None,
+            model_type=mc['type'],
+            accumulate_every=batch_size if is_rodcnn else 1,
         )
         val_metrics = _run_epoch(
             model, val_loader, optimizer, scaler, scheduler, device,
@@ -498,7 +526,9 @@ def train(cfg: dict) -> None:
             grad_clip=tc.get('grad_clip', 1.0),
             log_interval=0,
             is_train=False,
-            n_outputs=n_outputs_cfg if subset_mode else None,
+            mode_idx=mode_idx if subset_mode else None,
+            model_type=mc['type'],
+            accumulate_every=batch_size if is_rodcnn else 1,
         )
         epoch_elapsed = time.time() - t_epoch
 
@@ -509,11 +539,11 @@ def train(cfg: dict) -> None:
               f"WFE={val_metrics['wfe_rms']*1e9:.1f} nm  "
               f"Strehl={val_metrics['strehl']:.3f}  "
               f"[{epoch_elapsed:.0f}s]")
-        mode_range = n_outputs_cfg if subset_mode else n_modes_hdf5
         subset_note = " [subset mode]" if subset_mode else ""
         print(f"  Per-mode val RMS (nm):{subset_note}")
-        for i, rms in enumerate(val_metrics['mode_rms'][:mode_range]):
-            name = NOLL_NAMES[i] if i < len(NOLL_NAMES) else f"Z{i+2}"
+        for i, rms in enumerate(val_metrics['mode_rms']):
+            mode_j = trained_modes[i]
+            name = NOLL_MODE_NAMES.get(mode_j, f"Z{mode_j}")
             print(f"    {name:<28s} {rms*1e9:6.1f}")
 
         val_wfe = val_metrics['wfe_rms']

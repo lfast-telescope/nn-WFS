@@ -41,9 +41,37 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
 from dataset import CWFSDataset, train_val_test_split, get_n_modes
-from train import build_model, NOLL_NAMES
+from train import build_model, NOLL_MODE_NAMES
 from models.cnn_cwfs import RODCNN
 from utils.metrics import per_mode_rms, total_wfe_rms, strehl_proxy
+
+
+def trained_modes_from_config(model_cfg: dict) -> Optional[list]:
+    """
+    Recover the ordered list of Noll indices a checkpoint was trained on.
+
+    Prefers the explicit `trained_modes` field (current schema).  Falls back
+    to `n_outputs` for legacy checkpoints, reconstructing
+    `trained_modes = list(range(1, n_outputs + 1))` (Z1..Zn) -- this matches
+    the *actual* (bug-for-bug) behaviour those old checkpoints were trained
+    under (contiguous truncation from column 0), not the newer Z2-start
+    convention.  Returns None if neither field is present.
+    """
+    trained_modes = model_cfg.get('trained_modes')
+    if trained_modes is not None:
+        return list(trained_modes)
+    n_outputs = model_cfg.get('n_outputs')
+    if n_outputs is not None:
+        return list(range(1, n_outputs + 1))
+    return None
+
+
+def mode_names_from_config(model_cfg: dict) -> Optional[list]:
+    """Display names (e.g. 'Z5 (obl-astig)') for a checkpoint's trained modes."""
+    trained_modes = trained_modes_from_config(model_cfg)
+    if trained_modes is None:
+        return None
+    return [NOLL_MODE_NAMES.get(m, f"Z{m}") for m in trained_modes]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -150,7 +178,7 @@ def _metrics_table(pred: torch.Tensor, target: torch.Tensor) -> dict:
     }
 
 
-def _print_table(metrics: dict, header: str = '') -> None:
+def _print_table(metrics: dict, header: str = '', mode_names: Optional[list] = None) -> None:
     """Pretty-print a metrics dict to stdout."""
     if header:
         print(f"\n{'─'*60}")
@@ -159,7 +187,8 @@ def _print_table(metrics: dict, header: str = '') -> None:
     print(f"  Total WFE rms : {metrics['wfe_rms_nm']:.2f} nm")
     print(f"  Strehl proxy  : {metrics['strehl']:.4f}")
     print("  Per-mode RMS (nm):")
-    for name, rms in zip(NOLL_NAMES, metrics['mode_rms_nm']):
+    names = mode_names if mode_names is not None else [f"mode {i+1}" for i in range(len(metrics['mode_rms_nm']))]
+    for name, rms in zip(names, metrics['mode_rms_nm']):
         print(f"    {name:<30s} {rms:6.2f}")
 
 
@@ -173,6 +202,7 @@ def eval_synthetic(
     label_mean: np.ndarray,
     label_std: np.ndarray,
     device: Optional[torch.device] = None,
+    mode_names: Optional[list] = None,
 ) -> dict:
     """
     Evaluate model on the synthetic test set.
@@ -181,13 +211,15 @@ def eval_synthetic(
     ----------
     model       : nn.Module (already on device, eval mode)
     test_loader : DataLoader yielding z-scored {'I1','I2','r','labels'}
-    label_mean  : ndarray[14] — training-set label mean
-    label_std   : ndarray[14] — training-set label std
+    label_mean  : ndarray — training-set label mean
+    label_std   : ndarray — training-set label std
     device      : torch.device (defaults to model's first parameter device)
+    mode_names  : list[str], optional — per-mode display names (see
+        `mode_names_from_config`); falls back to generic names if omitted.
 
     Returns
     -------
-    dict with keys 'mode_rms_nm' (list[14]), 'wfe_rms_nm' (float), 'strehl' (float)
+    dict with keys 'mode_rms_nm' (list), 'wfe_rms_nm' (float), 'strehl' (float)
     """
     if device is None:
         device = next(model.parameters()).device
@@ -195,7 +227,7 @@ def eval_synthetic(
     ls = torch.from_numpy(label_std)
     pred, target = _predict(model, test_loader, lm, ls, device)
     metrics = _metrics_table(pred, target)
-    _print_table(metrics, header="Synthetic test-set evaluation")
+    _print_table(metrics, header="Synthetic test-set evaluation", mode_names=mode_names)
     return metrics
 
 
@@ -205,6 +237,7 @@ def ablation_roddier(
     label_mean: np.ndarray,
     label_std: np.ndarray,
     device: Optional[torch.device] = None,
+    mode_names: Optional[list] = None,
 ) -> dict:
     """
     Compare model performance with and without the Roddier r channel.
@@ -228,8 +261,8 @@ def ablation_roddier(
     m_full    = _metrics_table(pred_full,    target)
     m_ablated = _metrics_table(pred_ablated, target)
 
-    _print_table(m_full,    header="Ablation: WITH Roddier signal r")
-    _print_table(m_ablated, header="Ablation: WITHOUT Roddier signal r (r = 0)")
+    _print_table(m_full,    header="Ablation: WITH Roddier signal r", mode_names=mode_names)
+    _print_table(m_ablated, header="Ablation: WITHOUT Roddier signal r (r = 0)", mode_names=mode_names)
 
     delta_wfe = m_ablated['wfe_rms_nm'] - m_full['wfe_rms_nm']
     print(f"\n  WFE degradation without r: +{delta_wfe:.2f} nm  "
@@ -264,10 +297,12 @@ def compare_models(
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     results = {}
+    mode_names_by_model = {}
     for name, ckpt_path in [('transformer', ckpt_transformer), ('cnn', ckpt_cnn)]:
         model, meta = load_checkpoint(ckpt_path, device)
         lm = torch.from_numpy(meta['label_mean'])
         ls = torch.from_numpy(meta['label_std'])
+        mode_names_by_model[name] = mode_names_from_config(meta['config']['model'])
         # test_loader returns raw physical labels (label_stats=None).
         # _predict must denorm predictions only (labels_are_zscored=False).
         pred, target = _predict(model, test_loader, lm, ls, device,
@@ -275,14 +310,17 @@ def compare_models(
         results[name] = _metrics_table(pred, target)
         _print_table(results[name],
                      header=f"{name.upper()}  (epoch {meta['epoch']}, "
-                            f"val WFE {meta['val_wfe_rms']*1e9:.1f} nm)")
+                            f"val WFE {meta['val_wfe_rms']*1e9:.1f} nm)",
+                     mode_names=mode_names_by_model[name])
 
     # Difference table
     print(f"\n{'─'*60}")
     print("Per-mode difference:  CNN − Transformer  (nm, positive = CNN worse)")
     print('─'*60)
+    diff_names = mode_names_by_model['transformer'] or mode_names_by_model['cnn'] or \
+        [f"mode {i+1}" for i in range(len(results['transformer']['mode_rms_nm']))]
     for name, t_rms, c_rms in zip(
-        NOLL_NAMES,
+        diff_names,
         results['transformer']['mode_rms_nm'],
         results['cnn']['mode_rms_nm'],
     ):
@@ -499,11 +537,11 @@ if __name__ == '__main__':
         for ckpt_name, ckpt_path in [('ckpt_transformer', args.ckpt_transformer),
                                      ('ckpt_cnn', args.ckpt_cnn)]:
             _, _meta = load_checkpoint(ckpt_path, device)
-            n_out = _meta['config']['model'].get('n_outputs')
-            if n_out is not None and n_modes_hdf5 != n_out:
+            _tm = trained_modes_from_config(_meta['config']['model'])
+            if _tm is not None and max(_tm) > n_modes_hdf5:
                 raise ValueError(
                     f"n_modes mismatch: HDF5 has {n_modes_hdf5} label columns but "
-                    f"{ckpt_name} model.n_outputs={n_out}."
+                    f"{ckpt_name} model.trained_modes references Z{max(_tm)}."
                 )
         # raw-label loader so each model uses its own normalisation stats
         test_loader = make_test_loader(args.hdf5_path, label_stats=None,
@@ -522,21 +560,22 @@ if __name__ == '__main__':
     label_stats = {'mean': lm, 'std': ls}
 
     if args.hdf5_path:
-        n_modes_hdf5  = get_n_modes(args.hdf5_path)
-        n_outputs_ckpt = meta['config']['model'].get('n_outputs')
-        if n_outputs_ckpt is not None and n_modes_hdf5 != n_outputs_ckpt:
+        n_modes_hdf5   = get_n_modes(args.hdf5_path)
+        trained_modes_ckpt = trained_modes_from_config(meta['config']['model'])
+        if trained_modes_ckpt is not None and max(trained_modes_ckpt) > n_modes_hdf5:
             raise ValueError(
                 f"n_modes mismatch: HDF5 has {n_modes_hdf5} label columns but "
-                f"checkpoint model.n_outputs={n_outputs_ckpt}.  "
+                f"checkpoint model.trained_modes references Z{max(trained_modes_ckpt)}.  "
                 f"Ensure the checkpoint and dataset were produced with the same n_modes."
             )
+        mode_names = mode_names_from_config(meta['config']['model'])
         test_loader = make_test_loader(args.hdf5_path, label_stats=label_stats,
                                        batch_size=args.batch_size,
                                        num_workers=args.num_workers)
-        eval_synthetic(model, test_loader, lm, ls, device)
+        eval_synthetic(model, test_loader, lm, ls, device, mode_names=mode_names)
 
         if args.ablate_roddier:
-            ablation_roddier(model, test_loader, lm, ls, device)
+            ablation_roddier(model, test_loader, lm, ls, device, mode_names=mode_names)
 
     if args.onsky_dir:
         # Minimal on-sky loader: load all PSF pairs from directory as numpy arrays.

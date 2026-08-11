@@ -2,39 +2,93 @@ import numpy as np
 import torch
 
 # ──────────────────────────────────────────────────────────────────────
-# Noll Zernike mode metadata for Z2..Z15  (label vector indices 0..13)
+# Noll Zernike index → (radial order n, signed azimuthal frequency m)
 # ──────────────────────────────────────────────────────────────────────
-# Noll convention: even j → cos term (m > 0 or m = 0); odd j → sin term (m < 0)
-#
-# idx  Noll-j  (n, m)   angular form
-# ---  ------  ------   ------------
-#   0    2     (1,+1)   cos  θ      x-tilt
-#   1    3     (1,-1)   sin  θ      y-tilt
-#   2    4     (2, 0)   —           defocus          ← radially symmetric
-#   3    5     (2,-2)   sin 2θ      oblique astig
-#   4    6     (2,+2)   cos 2θ      vertical astig
-#   5    7     (3,-1)   sin  θ      vertical coma
-#   6    8     (3,+1)   cos  θ      horizontal coma
-#   7    9     (3,-3)   sin 3θ      vertical trefoil
-#   8   10     (3,+3)   cos 3θ      oblique trefoil
-#   9   11     (4, 0)   —           primary spherical ← radially symmetric
-#  10   12     (4,+2)   cos 2θ      2nd-order vert. astig
-#  11   13     (4,-2)   sin 2θ      2nd-order obl. astig
-#  12   14     (4,+4)   cos 4θ
-#  13   15     (4,-4)   sin 4θ
-#
-# Each entry: (cos_label_idx, sin_label_idx, azimuthal_order_m)
-_PAIRS = [
-    ( 0,  1, 1),   # Z2  (cos θ),   Z3  (sin θ)   — m=1
-    ( 6,  5, 1),   # Z8  (cos θ),   Z7  (sin θ)   — m=1
-    ( 4,  3, 2),   # Z6  (cos 2θ),  Z5  (sin 2θ)  — m=2
-    (10, 11, 2),   # Z12 (cos 2θ),  Z13 (sin 2θ)  — m=2
-    ( 8,  7, 3),   # Z10 (cos 3θ),  Z9  (sin 3θ)  — m=3
-    (12, 13, 4),   # Z14 (cos 4θ),  Z15 (sin 4θ)  — m=4
-]
+# Noll (1976) convention: for a given radial order n, modes are ordered so
+# that even j → m >= 0 (cosine term), odd j → m <= 0 (sine term); m == 0
+# modes are radially symmetric (defocus Z4, spherical Z11, ...) and are
+# invariant under all D4 operations.
 
-# Radially-symmetric modes: invariant under all D4 operations
-_SINGLETONS = [2, 9]   # Z4 (defocus), Z11 (primary spherical)
+
+def noll_to_nm(j: int) -> tuple[int, int]:
+    """
+    Convert a 1-based Noll Zernike index to (radial order n, signed
+    azimuthal frequency m).
+
+    Standard Noll (1976) algorithm.  Verified against the historical
+    hardcoded Z2-Z15 table this module used to ship with:
+        Z2:(1,+1) Z3:(1,-1) Z4:(2,0) Z5:(2,-2) Z6:(2,+2) Z7:(3,-1) Z8:(3,+1)
+        Z9:(3,-3) Z10:(3,+3) Z11:(4,0) Z12:(4,+2) Z13:(4,-2) Z14:(4,+4) Z15:(4,-4)
+    """
+    if j < 1:
+        raise ValueError(f"Noll index must be >= 1, got {j}")
+    n = 0
+    j1 = j - 1
+    while j1 > n:
+        n += 1
+        j1 -= n
+    m = (-1) ** j * ((n % 2) + 2 * ((j1 + (n + 1) % 2) // 2))
+    return n, m
+
+
+def _find_pairs(trained_modes: list[int]) -> list[tuple[int, int, int]]:
+    """
+    For an ascending list of Noll indices, resolve the cos/sin partner of
+    every non-singleton (m != 0) mode.
+
+    Returns a list of (cos_position, sin_position, m) triples, where
+    positions are indices into `trained_modes` (i.e. into the truncated
+    label vector), and m > 0 (the pair's positive azimuthal frequency).
+
+    Raises
+    ------
+    ValueError
+        If a mode with m != 0 is present without its cos/sin partner also
+        present in `trained_modes`.  D4 rotation mixes a (cos, sin) pair
+        together, so both must be part of the trained output vector.
+    """
+    position = {mode: i for i, mode in enumerate(trained_modes)}
+    max_j = max(trained_modes)
+    nm_table = {j: noll_to_nm(j) for j in range(1, max_j + 1)}
+    by_nm = {}
+    for j, (n, m) in nm_table.items():
+        by_nm.setdefault((n, m), j)
+
+    pairs: list[tuple[int, int, int]] = []
+    handled: set[int] = set()
+    for mode in trained_modes:
+        if mode in handled:
+            continue
+        n, m = nm_table[mode]
+        if m == 0:
+            handled.add(mode)
+            continue
+        partner = by_nm.get((n, -m))
+        if partner is None or partner not in position:
+            partner_label = f"Z{partner}" if partner is not None else "its partner mode"
+            raise ValueError(
+                f"trained_modes={trained_modes} is missing the cos/sin partner of "
+                f"Z{mode} (n={n}, m={m}): {partner_label} (n={n}, m={-m}) must also "
+                f"be included.  D4 rotation mixes cos/sin pairs together, so the "
+                f"model may only be trained on complete pairs (radially symmetric "
+                f"modes such as Z4/Z11 are exempt)."
+            )
+        cos_mode, sin_mode = (mode, partner) if m > 0 else (partner, mode)
+        pairs.append((position[cos_mode], position[sin_mode], abs(m)))
+        handled.add(mode)
+        handled.add(partner)
+
+    return pairs
+
+
+def validate_trained_modes_pairing(trained_modes: list[int]) -> None:
+    """
+    Raise ValueError if `trained_modes` does not form complete cos/sin pairs
+    for every non-singleton mode.  Call this unconditionally at config
+    validation time (independent of whether augmentation is enabled) since
+    the model may only be trained on pairing-complete mode sets.
+    """
+    _find_pairs(list(trained_modes))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -95,28 +149,30 @@ def _build_d4_label_matrices():
     The flip flag and rot_k (0–3) index are encoded as:
         op_idx < 4  →  flip=False, rot_k = op_idx
         op_idx >= 4 →  flip=True,  rot_k = op_idx % 4
+
+    Raises ValueError (via `_find_pairs`) if any non-singleton mode's
+    partner is missing from `trained_modes`.
     """
+    trained_modes = list(trained_modes)
+    n_out = len(trained_modes)
+    pairs = _find_pairs(trained_modes)
+
     ops = [
         (False, 0), (False, 1), (False, 2), (False, 3),
         (True,  0), (True,  1), (True,  2), (True,  3),
     ]
     matrices = []
     for (flip, rot_k) in ops:
-        M = np.eye(14, dtype=np.float32)
-        for (cos_idx, sin_idx, m) in _PAIRS:
+        M = np.eye(n_out, dtype=np.float32)
+        for (cos_idx, sin_idx, m) in pairs:
             block = _zernike_block_2x2(m, flip, rot_k)
             M[cos_idx, cos_idx] = block[0, 0]
             M[cos_idx, sin_idx] = block[0, 1]
             M[sin_idx, cos_idx] = block[1, 0]
             M[sin_idx, sin_idx] = block[1, 1]
         # singleton rows (radially symmetric) remain on the identity diagonal
-        matrices.append(M)
+        matrices.append(torch.from_numpy(M))
     return matrices
-
-
-# Pre-computed at module load time (cost: 8 × 14×14 multiplications)
-_D4_LABEL_MATRICES = _build_d4_label_matrices()
-_D4_LABEL_TENSORS  = [torch.from_numpy(M) for M in _D4_LABEL_MATRICES]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -138,6 +194,9 @@ class D4Augment:
 
     Parameters
     ----------
+    trained_modes : list[int]
+        Ascending list of Noll Zernike indices the label vector represents,
+        in order.  Must be pairing-complete (see `validate_trained_modes_pairing`).
     p : float
         Probability of applying *any* non-identity transform on each call.
         Default 7/8 gives a uniform distribution over all 8 operations
@@ -152,8 +211,9 @@ class D4Augment:
         """
         Parameters
         ----------
-        sample : dict with keys 'I1', 'I2', 'r'  (each Tensor[1, H, W])
-                                  'labels'          (Tensor[14])
+        sample : dict with keys 'I1', 'I2' (each Tensor[..., H, W]),
+                                  optionally 'r' and/or 'R' (Tensor[..., H, W]),
+                                  'labels' (Tensor[len(trained_modes)])
 
         Returns
         -------

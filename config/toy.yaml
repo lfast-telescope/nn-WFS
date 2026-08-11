@@ -5,7 +5,7 @@ model:
   patch_size: 16
   embed_dim: 128
   dropout: 0.1
-  n_outputs: 36
+  trained_modes: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]
 
 data:
   hdf5_path: null         # override on the command line: --hdf5_path /path/to/data.h5
