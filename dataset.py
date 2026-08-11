@@ -51,8 +51,9 @@ class CWFSDataset(Dataset):
     label_stats : dict or None
         Optional {'mean': ndarray, 'std': ndarray} for z-score normalisation.
     transform : callable or None
-        Applied to the sample dict after construction.
-        Not supported when return_stacks=True.
+        Applied to the sample dict after construction.  Supports both
+        return_stacks=False (keys 'I1','I2','r') and return_stacks=True
+        (keys 'I1','I2','R') sample shapes.
     return_stacks : bool
         If False (default): T² item expansion — each example yields T² items,
         each item returns {I1:[1,H,W], I2:[1,H,W], r:[1,H,W], labels}.
@@ -82,12 +83,6 @@ class CWFSDataset(Dataset):
             shape = f['psfs'].shape   # (N, 2, T, H, W) or (N, 2, H, W)
         self._temporal = (len(shape) == 5)
         self.T = int(shape[2]) if self._temporal else 1
-
-        if return_stacks and transform is not None:
-            raise ValueError(
-                "transform is not supported with return_stacks=True. "
-                "Disable augmentation in the data config when using stack input modes."
-            )
 
     # ------------------------------------------------------------------
     # pickling: drop the open file handle so forked workers open fresh

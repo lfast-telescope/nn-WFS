@@ -14,8 +14,7 @@ data:
   # over its T temporal frames (T² Roddier pairs) by the model itself.
   batch_size: 8
   num_workers: 4
-  augment: true
-
+  augment: false
 training:
   epochs: 50
   lr: 3.0e-4

@@ -132,9 +132,13 @@ def _zernike_block_2x2(m, flip, rot_k):
                          [ s, -c]], dtype=np.float32)
 
 
-def _build_d4_label_matrices():
+def build_d4_label_matrices(trained_modes: list[int]) -> list[torch.Tensor]:
     """
-    Pre-compute the 8 D4 label-transformation matrices (14×14, float32).
+    Build the 8 D4 dihedral label-transformation matrices for an arbitrary
+    ascending list of Noll Zernike indices `trained_modes`.
+
+    Each matrix is sized `len(trained_modes) x len(trained_modes)` and acts
+    on a label vector whose entries follow the order of `trained_modes`.
 
     Ordering of the 8 D4 operations:
         0 : identity
@@ -182,10 +186,9 @@ def _build_d4_label_matrices():
 class D4Augment:
     """
     Randomly apply one of the 8 D4 dihedral symmetry operations to a CWFS
-    sample, transforming both the PSF images and the Zernike label vector
+    sample, transforming the PSF images and the Zernike label vector
     consistently.
 
-    The 8 operations are defined in _build_d4_label_matrices (above).
     Rotation and reflection of the label vector is derived analytically from
     the irradiance transport equation (Roddier 1993): under a coordinate
     rotation by φ, an azimuthal-order-m Zernike pair (cos, sin) transforms
@@ -199,13 +202,14 @@ class D4Augment:
         in order.  Must be pairing-complete (see `validate_trained_modes_pairing`).
     p : float
         Probability of applying *any* non-identity transform on each call.
-        Default 7/8 gives a uniform distribution over all 8 operations
-        (each op is picked with probability 1/8).  Set to 1.0 to sample
-        uniformly from all 8 including identity.
+        Default 1.0 samples uniformly from all 8 operations (including
+        identity, each with probability 1/8).
     """
 
-    def __init__(self, p=1.0):
+    def __init__(self, trained_modes: list[int], p: float = 1.0):
+        self.trained_modes = list(trained_modes)
         self.p = float(p)
+        self._label_matrices = build_d4_label_matrices(self.trained_modes)
 
     def __call__(self, sample):
         """
@@ -229,13 +233,15 @@ class D4Augment:
         flip  = op_idx >= 4
         rot_k = op_idx % 4
 
-        I1     = _apply_image_op(sample['I1'], flip, rot_k)
-        I2     = _apply_image_op(sample['I2'], flip, rot_k)
-        r      = _apply_image_op(sample['r'],  flip, rot_k)
-        M      = _D4_LABEL_TENSORS[op_idx].to(sample['labels'].device)
-        labels = M @ sample['labels']
+        out = dict(sample)
+        for key in ('I1', 'I2', 'r', 'R'):
+            if key in sample:
+                out[key] = _apply_image_op(sample[key], flip, rot_k)
 
-        return {'I1': I1, 'I2': I2, 'r': r, 'labels': labels}
+        M = self._label_matrices[op_idx].to(sample['labels'].device)
+        out['labels'] = M @ sample['labels']
+
+        return out
 
 
 # ──────────────────────────────────────────────────────────────────────
