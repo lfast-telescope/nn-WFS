@@ -1,7 +1,7 @@
 import numpy as np
 import h5py
 import torch
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset
 
 # Roddier signal stabilisation constant
 EPS_RODDIER = 1e-6
@@ -252,69 +252,3 @@ def compute_label_stats(hdf5_path, train_indices):
     mean = labels.mean(axis=0).astype(np.float32)
     std  = labels.std(axis=0).astype(np.float32)
     return {'mean': mean, 'std': std}
-
-
-# ──────────────────────────────────────────────────────────────────────
-# RODCNN dataset utilities
-# ──────────────────────────────────────────────────────────────────────
-
-class GroupedBatchSampler(Sampler):
-    """
-    Batch sampler that yields batches where every index belongs to the same
-    mirror state.
-
-    The dataset is assumed to store `group_size` consecutive rows per mirror
-    state (same Zernike label, independently evolved atmospheric realisation
-    for each row).  The grouping is derived purely from index position:
-        state_id = global_index // group_size
-
-    Required for RODCNN training, which forms B² Roddier cross-pairs within
-    each batch and requires all B samples to share the same Zernike label.
-
-    Parameters
-    ----------
-    indices    : array-like of int   — dataset indices (e.g. train_idx)
-    group_size : int                 — consecutive same-state rows per mirror state
-    batch_size : int or None         — indices per batch; defaults to group_size
-    shuffle    : bool                — shuffle group order each epoch
-    seed       : int                 — RNG seed for reproducible shuffling
-    drop_last  : bool                — drop incomplete groups (default True)
-    """
-
-    def __init__(
-        self,
-        indices,
-        group_size: int,
-        batch_size: int | None = None,
-        shuffle: bool = True,
-        seed: int = 42,
-        drop_last: bool = True,
-    ):
-        self.group_size = group_size
-        self.batch_size = batch_size if batch_size is not None else group_size
-        self.shuffle    = shuffle
-        self.drop_last  = drop_last
-        self._rng       = np.random.default_rng(seed)
-
-        indices   = np.asarray(indices, dtype=np.int64)
-        state_ids = indices // group_size
-        unique_states = np.unique(state_ids)
-
-        self._groups: list[list[int]] = []
-        for sid in unique_states:
-            group = indices[state_ids == sid].tolist()
-            for start in range(0, len(group) - self.batch_size + 1, self.batch_size):
-                self._groups.append(group[start : start + self.batch_size])
-            if not drop_last:
-                tail_start = (len(group) // self.batch_size) * self.batch_size
-                if tail_start < len(group):
-                    self._groups.append(group[tail_start:])
-
-    def __iter__(self):
-        groups = list(self._groups)
-        if self.shuffle:
-            self._rng.shuffle(groups)
-        yield from groups
-
-    def __len__(self) -> int:
-        return len(self._groups)

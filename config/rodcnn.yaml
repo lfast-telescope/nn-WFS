@@ -9,12 +9,9 @@ data:
   hdf5_path: null         # override on the command line: --hdf5_path /path/to/data.h5
   split_ratios: [0.80, 0.10, 0.10]
   split_seed: 42
-  # batch_size: number of same-mirror-state examples drawn per batch.
-  # group_size: consecutive rows in the HDF5 file that share the same mirror
-  #   state (same Zernike label, independently evolved atmosphere each row).
-  #   GroupedBatchSampler uses group_size to locate same-state rows.
-  #   Set group_size = batch_size if each mirror state spans exactly batch_size
-  #   consecutive rows; set larger if you want to sub-sample within a group.
+  # batch_size: number of examples accumulated per optimizer step (gradient
+  # accumulation window).  Each example is one HDF5 row, batched internally
+  # over its T temporal frames (T² Roddier pairs) by the model itself.
   batch_size: 8
   group_size: 8
   num_workers: 4

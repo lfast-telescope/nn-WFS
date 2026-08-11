@@ -28,7 +28,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
 try:
     import yaml
@@ -41,9 +41,8 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
 from dataset import (
-    CWFSDataset, train_val_test_split, compute_label_stats,
-    GroupedBatchSampler,get_n_modes
-), 
+    CWFSDataset, train_val_test_split, compute_label_stats, get_n_modes
+)
 from models.transformer_cwfs import TransformerCWFS
 from models.cnn_cwfs import SIAMCNN, RODCNN, CNNCWFS
 from models.toy_model import SLPCWFS
@@ -380,20 +379,17 @@ def train(cfg: dict) -> None:
 
     n_workers = dc.get('num_workers', 4)
     batch_size = dc.get('batch_size', 64)
-    if mc['type'].lower() == 'rodcnn':
-        group_size    = dc.get('group_size', batch_size)
-        train_sampler = GroupedBatchSampler(
-            train_idx, group_size, batch_size=batch_size, shuffle=True,
-        )
-        val_sampler   = GroupedBatchSampler(
-            val_idx, group_size, batch_size=batch_size, shuffle=False,
-        )
+    if is_rodcnn:
+        # batch_size is repurposed as the gradient-accumulation window
+        # (examples per optimizer step).  The loader yields one example
+        # (all T frames) per iteration -- no collation, so I1/I2 keep their
+        # natural [T,H,W] shape (no cross-example mixing).
         train_loader = DataLoader(
-            train_ds, batch_sampler=train_sampler,
+            train_ds, batch_size=None, sampler=RandomSampler(train_ds),
             num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
         )
         val_loader = DataLoader(
-            val_ds, batch_sampler=val_sampler,
+            val_ds, batch_size=None, sampler=SequentialSampler(val_ds),
             num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
         )
     else:

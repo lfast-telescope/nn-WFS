@@ -262,9 +262,12 @@ class RODCNN(nn.Module):
 
     Architecture
     ------------
-    Input: B intra-focal images (I1) and B extra-focal images (I2), all drawn
-    from the same mirror state (same Zernike label) with independent atmospheric
-    realisations.  Requires GroupedBatchSampler so every batch is same-state.
+    Input: the B=T intra-focal frames (I1) and B=T extra-focal frames (I2)
+    of a *single* HDF5 example (same mirror state, independent atmospheric
+    realisations per frame — see CWFSDataset's return_stacks=True mode).
+    train.py feeds one example per iteration (no cross-example batching),
+    so every (I1_i, I2_j) pair formed below is guaranteed to share the same
+    Zernike label.
 
     B² expansion (inside forward):
         All B×B combinations of (I1_i, I2_j) are formed, yielding B² Roddier
@@ -276,9 +279,10 @@ class RODCNN(nn.Module):
         → MLPHead → [B², n_outputs]
 
     Training objective:
-        Loss on pred.mean(dim=0) vs labels[0].  Training the mean of B²
-        predictions forces the network to extract the invariant mirror
-        wavefront while averaging out diverse atmospheric realisations.
+        Loss on pred.mean(dim=0) vs the example's (single) label vector.
+        Training the mean of B² predictions forces the network to extract
+        the invariant mirror wavefront while averaging out diverse
+        atmospheric realisations.
 
     Parameters
     ----------
