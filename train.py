@@ -279,13 +279,13 @@ def _run_epoch(
 
             # Intermediate logging
             elapsed = time.time() - t0
+            batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+            remaining_batches = len(loader) - (batch_idx + 1)
+            eta_sec = remaining_batches / batches_per_sec if batches_per_sec > 0 else 0
+            
+            phase = "train" if is_train else "val"
             if log_interval > 0 and (batch_idx + 1) % log_interval == 0:
                 avg_loss = (total_loss / (batch_idx + 1)).item()
-                batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
-                remaining_batches = len(loader) - (batch_idx + 1)
-                eta_sec = remaining_batches / batches_per_sec if batches_per_sec > 0 else 0
-
-                phase = "train" if is_train else "val"
                 print(f"  [{phase}] batch {batch_idx+1:4d}/{len(loader)}  "
                       f"loss={avg_loss:.4f}  "
                       f"time={elapsed:6.0f}s  eta={eta_sec:5.0f}s", end="")
@@ -320,7 +320,7 @@ NOLL_MODE_NAMES = {
     9: 'Z9 (vert-trefoil)', 10: 'Z10 (obl-trefoil)',
     11: 'Z11 (spherical)',
     12: 'Z12 (2nd-vert-astig)', 13: 'Z13 (2nd-obl-astig)',
-    14: 'Z14', 15: 'Z15',
+    14: 'Z14 (obl-quadrafoil)', 15: 'Z15 (vert-quadrafoil)',
 }
 
 
@@ -404,14 +404,17 @@ def train(cfg: dict) -> None:
     return_stacks = True if is_rodcnn else dc.get('return_stacks', False)
     compute_r_stack = (return_stacks and input_mode == 'r_stack')
     augment = D4Augment(trained_modes) if dc.get('augment', True) else None
+    preload = dc.get('preload', False)
     train_ds = CWFSDataset(hdf5_path, train_idx, label_stats=stats, transform=augment,
                            return_stacks=return_stacks,
                            compute_r_stack=compute_r_stack,
-                           mode_columns=mode_columns if subset_mode else None)
+                           mode_columns=mode_columns if subset_mode else None,
+                           preload=preload)
     val_ds   = CWFSDataset(hdf5_path, val_idx,   label_stats=stats,
                            return_stacks=return_stacks,
                            compute_r_stack=compute_r_stack,
-                           mode_columns=mode_columns if subset_mode else None)
+                           mode_columns=mode_columns if subset_mode else None,
+                           preload=preload)
 
     n_workers = dc.get('num_workers', 4)
     batch_size = dc.get('batch_size', 64)

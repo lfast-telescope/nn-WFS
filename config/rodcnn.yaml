@@ -14,6 +14,7 @@ data:
   # over its T temporal frames (T² Roddier pairs) by the model itself.
   batch_size: 8
   num_workers: 4
+  preload: true           # load all psfs into RAM at startup (~8.8s); eliminates 347ms/ex GZIP cost
   augment: false
 training:
   epochs: 50
@@ -31,5 +32,5 @@ training:
 
 logging:
   checkpoint_dir: checkpoints/rodcnn
-  log_interval: 1
+  log_interval: 1000
   save_top_k: 3

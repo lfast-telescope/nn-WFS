@@ -72,10 +72,20 @@ class CWFSDataset(Dataset):
         R = (I1 - I2) / (I1 + I2 + eps) on the CPU and include 'R' in the sample dict.
         Default False (avoids ~17MB CPU allocation/IPC transfer when models compute
         Roddier signals on GPU or only consume raw I1/I2 streams).
+    preload : bool
+        If True, load all psfs and labels for this split into RAM-resident numpy
+        arrays at __init__ time (one-time ~8.8 s sequential HDF5 read for 1500
+        examples).  Subsequent __getitem__ calls read from RAM (~3.7 ms each)
+        instead of from HDF5 (~347 ms each under the current gzip chunk=64 layout).
+        With num_workers>0, forked worker processes inherit the array via Linux
+        copy-on-write — the array is read-only so pages are never duplicated.
+        Default False (lazy HDF5 mode, appropriate when RAM is limited or the
+        HDF5 file has already been re-chunked to chunk=1).
     """
 
     def __init__(self, hdf5_path, indices, label_stats=None, transform=None,
-                 return_stacks=False, mode_columns=None, compute_r_stack=False):
+                 return_stacks=False, mode_columns=None, compute_r_stack=False,
+                 preload=False):
         self.path = str(hdf5_path)
         self.indices = np.asarray(indices, dtype=np.int64)
         self.label_stats = label_stats
@@ -92,8 +102,28 @@ class CWFSDataset(Dataset):
         self._temporal = (len(shape) == 5)
         self.T = int(shape[2]) if self._temporal else 1
 
+        # ── Optional preload into RAM ──────────────────────────────────
+        # Read examples in sorted HDF5-row order (each chunk decompressed once),
+        # then rearrange so _psfs_mem[local_idx] ↔ self.indices[local_idx].
+        self._psfs_mem   = None   # float16 ndarray [N, 2, T, H, W] or [N, 2, H, W]
+        self._labels_mem = None   # float32 ndarray [N, n_modes]
+        if preload:
+            sort_perm   = np.argsort(self.indices)          # local positions sorted by HDF5 row
+            inv_perm    = np.argsort(sort_perm)             # inverse: restores original order
+            sorted_rows = self.indices[sort_perm]           # global HDF5 rows, ascending
+            print(f"  Preloading {len(self.indices)} examples into RAM "
+                  f"(path={self.path})…", flush=True)
+            with h5py.File(self.path, 'r') as f:
+                raw_psfs   = f['psfs'][sorted_rows]         # float16, sorted order
+                raw_labels = f['labels'][sorted_rows]       # float32, sorted order
+            self._psfs_mem   = raw_psfs[inv_perm]           # restore self.indices order
+            self._labels_mem = raw_labels[inv_perm]
+            gb = self._psfs_mem.nbytes / 1e9
+            print(f"  Preload complete — {gb:.3f} GB float16 in RAM.", flush=True)
+
     # ------------------------------------------------------------------
-    # pickling: drop the open file handle so forked workers open fresh
+    # pickling: drop the open file handle so forked workers open fresh;
+    # _psfs_mem / _labels_mem are plain numpy arrays — safe to fork/COW.
     # ------------------------------------------------------------------
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -106,6 +136,60 @@ class CWFSDataset(Dataset):
         return len(self.indices) * self.T * self.T
 
     def __getitem__(self, idx):
+        # ── Preloaded path: read from RAM, skip HDF5 entirely ──────────
+        if self._psfs_mem is not None:
+            if self.return_stacks:
+                if self._temporal:
+                    I1 = torch.from_numpy(self._psfs_mem[idx, 0].astype(np.float32))  # [T,H,W]
+                    I2 = torch.from_numpy(self._psfs_mem[idx, 1].astype(np.float32))  # [T,H,W]
+                else:
+                    I1 = torch.from_numpy(self._psfs_mem[idx, 0].astype(np.float32)).unsqueeze(0)
+                    I2 = torch.from_numpy(self._psfs_mem[idx, 1].astype(np.float32)).unsqueeze(0)
+
+                sample = {'I1': I1, 'I2': I2}
+
+                if self.compute_r_stack:
+                    T = I1.shape[0]
+                    I1_exp = I1.unsqueeze(1)
+                    I2_exp = I2.unsqueeze(0)
+                    R = (I1_exp - I2_exp) / (I1_exp + I2_exp + EPS_RODDIER)
+                    sample['R'] = R.reshape(T * T, *R.shape[2:])
+
+                labels = torch.from_numpy(self._labels_mem[idx].astype(np.float32))
+            else:
+                # pair-expansion mode
+                T = self.T
+                example_idx = idx // (T * T)
+                frame_i     = (idx // T) % T
+                frame_j     = idx % T
+                if self._temporal:
+                    I1 = torch.from_numpy(
+                        self._psfs_mem[example_idx, 0, frame_i].astype(np.float32)
+                    ).unsqueeze(0)                                             # [1, H, W]
+                    I2 = torch.from_numpy(
+                        self._psfs_mem[example_idx, 1, frame_j].astype(np.float32)
+                    ).unsqueeze(0)                                             # [1, H, W]
+                else:
+                    I1 = torch.from_numpy(self._psfs_mem[example_idx, 0].astype(np.float32)).unsqueeze(0)
+                    I2 = torch.from_numpy(self._psfs_mem[example_idx, 1].astype(np.float32)).unsqueeze(0)
+
+                r = (I1 - I2) / (I1 + I2 + EPS_RODDIER)
+                labels = torch.from_numpy(self._labels_mem[example_idx].astype(np.float32))
+                sample = {'I1': I1, 'I2': I2, 'r': r}
+
+            # shared label normalisation + mode selection
+            if self.label_stats is not None:
+                mean = torch.as_tensor(self.label_stats['mean'], dtype=torch.float32)
+                std  = torch.as_tensor(self.label_stats['std'],  dtype=torch.float32)
+                labels = (labels - mean) / (std + 1e-8)
+            if self.mode_idx is not None:
+                labels = labels[self.mode_idx]
+            sample['labels'] = labels
+            if self.transform is not None:
+                sample = self.transform(sample)
+            return sample
+
+        # ── Lazy HDF5 path (preload=False) ─────────────────────────────
         if self._file is None:
             self._file = h5py.File(self.path, 'r')
 
@@ -141,6 +225,7 @@ class CWFSDataset(Dataset):
                 mean = torch.as_tensor(self.label_stats['mean'], dtype=torch.float32)
                 std  = torch.as_tensor(self.label_stats['std'],  dtype=torch.float32)
                 labels = (labels - mean) / (std + 1e-8)
+            # Select mode columns if specified (subset mode)
             if self.mode_idx is not None:
                 labels = labels[self.mode_idx]
             sample['labels'] = labels
@@ -212,10 +297,9 @@ def train_val_test_split(hdf5_path, ratios=(0.80, 0.10, 0.10), seed=42):
         raise ValueError(f"Ratios must sum to 1.0, got {sum(ratios):.6f}")
 
     with h5py.File(hdf5_path, 'r') as f:
-        valid_indices = np.array(
-            [i for i, row in enumerate(f['labels']) if np.max(row) > 0],
-            dtype=np.int64,
-        )
+        labels = f['labels'][:]
+        valid_mask = np.max(np.abs(labels), axis=-1) > 0
+        valid_indices = np.nonzero(valid_mask)[0].astype(np.int64)
     N = len(valid_indices)
     if N == 0:
         raise ValueError(f"No valid (non-zero) examples found in {hdf5_path}")
