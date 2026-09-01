@@ -202,7 +202,7 @@ def _run_epoch(
     model.train(is_train)
     criterion = nn.MSELoss()
 
-    total_loss = 0.0
+    total_loss = torch.zeros((), device=device)
     all_pred   = []
     all_target = []
     t0 = time.time()
@@ -267,25 +267,25 @@ def _run_epoch(
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
-            total_loss += loss.item() * accumulate_every
+            total_loss += loss.detach() * accumulate_every
 
-            # accumulate denormalised predictions for physical metrics
+            # accumulate detached predictions on GPU for physical metrics
             if is_rodcnn:
-                all_pred.append((pred.detach().unsqueeze(0) * ls + lm).cpu())
-                all_target.append((labels.detach().unsqueeze(0) * ls + lm).cpu())
+                all_pred.append(pred.detach().unsqueeze(0))
+                all_target.append(labels.detach().unsqueeze(0))
             else:
-                all_pred.append((pred.detach() * ls + lm).cpu())
-                all_target.append((labels.detach() * ls + lm).cpu())
+                all_pred.append(pred.detach())
+                all_target.append(labels.detach())
 
             # Intermediate logging
             elapsed = time.time() - t0
-            avg_loss = total_loss / (batch_idx + 1)
-            batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
-            remaining_batches = len(loader) - (batch_idx + 1)
-            eta_sec = remaining_batches / batches_per_sec if batches_per_sec > 0 else 0
-            
-            phase = "train" if is_train else "val"
             if log_interval > 0 and (batch_idx + 1) % log_interval == 0:
+                avg_loss = (total_loss / (batch_idx + 1)).item()
+                batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+                remaining_batches = len(loader) - (batch_idx + 1)
+                eta_sec = remaining_batches / batches_per_sec if batches_per_sec > 0 else 0
+
+                phase = "train" if is_train else "val"
                 print(f"  [{phase}] batch {batch_idx+1:4d}/{len(loader)}  "
                       f"loss={avg_loss:.4f}  "
                       f"time={elapsed:6.0f}s  eta={eta_sec:5.0f}s", end="")
@@ -294,15 +294,15 @@ def _run_epoch(
                     print(f"  lr={lr:.2e}", end="")
                 print()
 
-    all_pred   = torch.cat(all_pred,   dim=0)
-    all_target = torch.cat(all_target, dim=0)
+    all_pred   = (torch.cat(all_pred,   dim=0) * ls + lm).cpu()
+    all_target = (torch.cat(all_target, dim=0) * ls + lm).cpu()
 
     mode_rms  = per_mode_rms(all_pred, all_target)
     wfe_rms   = total_wfe_rms(all_pred, all_target).item()
     strehl    = strehl_proxy(torch.tensor(wfe_rms)).item()
 
     return {
-        'loss':     total_loss / len(loader),
+        'loss':     (total_loss / len(loader)).item(),
         'wfe_rms':  wfe_rms,
         'strehl':   strehl,
         'mode_rms': mode_rms.tolist(),
@@ -399,14 +399,18 @@ def train(cfg: dict) -> None:
 
     # ── datasets & loaders ────────────────────────────────────────────
     is_rodcnn = mc['type'].lower() == 'rodcnn'
+    input_mode = mc.get('input_mode', 'pairs')
     # RODCNN always consumes per-example T-frame stacks (see Phase 4 batching below).
     return_stacks = True if is_rodcnn else dc.get('return_stacks', False)
+    compute_r_stack = (return_stacks and input_mode == 'r_stack')
     augment = D4Augment(trained_modes) if dc.get('augment', True) else None
     train_ds = CWFSDataset(hdf5_path, train_idx, label_stats=stats, transform=augment,
                            return_stacks=return_stacks,
+                           compute_r_stack=compute_r_stack,
                            mode_columns=mode_columns if subset_mode else None)
     val_ds   = CWFSDataset(hdf5_path, val_idx,   label_stats=stats,
                            return_stacks=return_stacks,
+                           compute_r_stack=compute_r_stack,
                            mode_columns=mode_columns if subset_mode else None)
 
     n_workers = dc.get('num_workers', 4)
