@@ -58,22 +58,30 @@ class CWFSDataset(Dataset):
         If False (default): T² item expansion — each example yields T² items,
         each item returns {I1:[1,H,W], I2:[1,H,W], r:[1,H,W], labels}.
         If True: 1 item per example, returns
-        {I1:[T,H,W], I2:[T,H,W], R:[T²,H,W], labels}.
-        Required for input_mode='two_stream' or 'r_stack'.
+        {I1:[T,H,W], I2:[T,H,W], labels} (and optionally 'R':[T²,H,W] if
+        compute_r_stack=True).
+        Required for input_mode='two_stream', 'r_stack', or 'rodcnn'.
     mode_columns : array-like of int or None
         If set, 0-based HDF5 label-column indices to select (subset mode
         training), in the given order — e.g. [4,5,6,7,8,9,10,11,12,13,14]
         selects Noll modes Z5..Z15.  Selection occurs after z-score
         normalisation but before the augmentation transform, ensuring
         D4Augment operates on correctly-sized, correctly-ordered labels.
+    compute_r_stack : bool
+        If True and return_stacks is True, compute all T² Roddier combinations
+        R = (I1 - I2) / (I1 + I2 + eps) on the CPU and include 'R' in the sample dict.
+        Default False (avoids ~17MB CPU allocation/IPC transfer when models compute
+        Roddier signals on GPU or only consume raw I1/I2 streams).
     """
 
-    def __init__(self, hdf5_path, indices, label_stats=None, transform=None, return_stacks=False, mode_columns=None):
+    def __init__(self, hdf5_path, indices, label_stats=None, transform=None,
+                 return_stacks=False, mode_columns=None, compute_r_stack=False):
         self.path = str(hdf5_path)
         self.indices = np.asarray(indices, dtype=np.int64)
         self.label_stats = label_stats
         self.transform = transform
         self.return_stacks = return_stacks
+        self.compute_r_stack = compute_r_stack
         # if set, select (and reorder) these 0-based label columns before augmentation
         self.mode_idx = torch.as_tensor(mode_columns, dtype=torch.long) if mode_columns is not None else None
         self._file = None          # opened lazily; one handle per DataLoader worker
@@ -116,12 +124,16 @@ class CWFSDataset(Dataset):
                 I1 = torch.from_numpy(psf_pair[0]).unsqueeze(0)      # [1, H, W]
                 I2 = torch.from_numpy(psf_pair[1]).unsqueeze(0)      # [1, H, W]
 
-            # Compute all T² Roddier combinations via broadcasting.
-            T = I1.shape[0]
-            I1_exp = I1.unsqueeze(1)   # [T, 1, H, W]
-            I2_exp = I2.unsqueeze(0)   # [1, T, H, W]
-            R = (I1_exp - I2_exp) / (I1_exp + I2_exp + EPS_RODDIER)  # [T, T, H, W]
-            R = R.reshape(T * T, *R.shape[2:])                        # [T², H, W]
+            sample = {'I1': I1, 'I2': I2}
+
+            # Optionally compute all T² Roddier combinations via broadcasting on CPU.
+            if self.compute_r_stack:
+                T = I1.shape[0]
+                I1_exp = I1.unsqueeze(1)   # [T, 1, H, W]
+                I2_exp = I2.unsqueeze(0)   # [1, T, H, W]
+                R = (I1_exp - I2_exp) / (I1_exp + I2_exp + EPS_RODDIER)  # [T, T, H, W]
+                R = R.reshape(T * T, *R.shape[2:])                        # [T², H, W]
+                sample['R'] = R
 
             raw_labels = self._file['labels'][i]
             labels = torch.from_numpy(raw_labels.astype(np.float32))
@@ -129,10 +141,9 @@ class CWFSDataset(Dataset):
                 mean = torch.as_tensor(self.label_stats['mean'], dtype=torch.float32)
                 std  = torch.as_tensor(self.label_stats['std'],  dtype=torch.float32)
                 labels = (labels - mean) / (std + 1e-8)
-            # Select mode columns if specified (subset mode)
             if self.mode_idx is not None:
                 labels = labels[self.mode_idx]
-            sample = {'I1': I1, 'I2': I2, 'R': R, 'labels': labels}
+            sample['labels'] = labels
             if self.transform is not None:
                 sample = self.transform(sample)
             return sample
