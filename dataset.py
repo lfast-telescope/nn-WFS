@@ -102,22 +102,39 @@ class CWFSDataset(Dataset):
         self._temporal = (len(shape) == 5)
         self.T = int(shape[2]) if self._temporal else 1
 
-        # ── Optional preload into RAM ──────────────────────────────────
-        # Read examples in sorted HDF5-row order (each chunk decompressed once),
-        # then rearrange so _psfs_mem[local_idx] ↔ self.indices[local_idx].
+        # ── Optional preload into RAM (for small datasets) ─────────────
         self._psfs_mem   = None   # float16 ndarray [N, 2, T, H, W] or [N, 2, H, W]
         self._labels_mem = None   # float32 ndarray [N, n_modes]
         if preload:
+            N = len(self.indices)
             sort_perm   = np.argsort(self.indices)          # local positions sorted by HDF5 row
             inv_perm    = np.argsort(sort_perm)             # inverse: restores original order
             sorted_rows = self.indices[sort_perm]           # global HDF5 rows, ascending
-            print(f"  Preloading {len(self.indices)} examples into RAM "
-                  f"(path={self.path})…", flush=True)
+
+            print(f"  Preloading {N} examples into RAM (path={self.path})…", flush=True)
             with h5py.File(self.path, 'r') as f:
-                raw_psfs   = f['psfs'][sorted_rows]         # float16, sorted order
-                raw_labels = f['labels'][sorted_rows]       # float32, sorted order
-            self._psfs_mem   = raw_psfs[inv_perm]           # restore self.indices order
-            self._labels_mem = raw_labels[inv_perm]
+                psfs_ds   = f['psfs']
+                labels_ds = f['labels']
+                full_n    = psfs_ds.shape[0]
+                chunk_n   = psfs_ds.chunks[0] if psfs_ds.chunks is not None else 1
+                psf_shape = psfs_ds.shape[1:]
+                n_modes   = labels_ds.shape[1]
+
+                self._psfs_mem   = np.empty((N, *psf_shape), dtype='float16')
+                self._labels_mem = np.empty((N, n_modes),    dtype='float32')
+
+                for cs in range(0, full_n, chunk_n):
+                    ce   = min(cs + chunk_n, full_n)
+                    mask = (sorted_rows >= cs) & (sorted_rows < ce)
+                    if not mask.any():
+                        continue
+                    chunk      = psfs_ds[cs:ce]           # contiguous slice read (fast)
+                    lbl_chunk  = labels_ds[cs:ce]
+                    local_rows = sorted_rows[mask] - cs
+                    dest       = inv_perm[np.where(mask)[0]]
+                    self._psfs_mem[dest]   = chunk[local_rows]
+                    self._labels_mem[dest] = lbl_chunk[local_rows]
+
             gb = self._psfs_mem.nbytes / 1e9
             print(f"  Preload complete — {gb:.3f} GB float16 in RAM.", flush=True)
 

@@ -107,8 +107,8 @@ simulation:
   # Centre-crop (or zero-pad) from the propagated grid to this size.
   img_size: 256
 
-  # HDF5 chunk shape along the N axis (affects read performance).
-  hdf5_chunk_size: 64
+  # HDF5 chunk shape along the N axis (1 enables sub-millisecond per-example streaming).
+  hdf5_chunk_size: 1
 
   random_seed: 42
 

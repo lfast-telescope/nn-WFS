@@ -48,6 +48,7 @@ from models.cnn_cwfs import SIAMCNN, RODCNN, CNNCWFS
 from models.toy_model import SLPCWFS
 from utils.augmentation import D4Augment, validate_trained_modes_pairing
 from utils.metrics import per_mode_rms, total_wfe_rms, strehl_proxy
+from utils.sparse_recorder import SparseRecorder
 
 # ─────────────────────────────────────────────────────────────────────
 # Config helpers
@@ -160,8 +161,8 @@ class CheckpointManager:
 # ─────────────────────────────────────────────────────────────────────
 
 def _run_epoch(
-    model: nn.Module,
-    loader: DataLoader,
+    model,
+    loader,
     optimizer,
     scaler,
     scheduler,
@@ -174,6 +175,7 @@ def _run_epoch(
     mode_idx: torch.Tensor = None,
     model_type: str = 'cnn',
     accumulate_every: int = 1,
+    k_pairs_train: Optional[int] = None,
 ) -> dict:
     """
     Run one epoch.  Returns a dict of scalar metrics.
@@ -181,22 +183,6 @@ def _run_epoch(
     During training (is_train=True) the model is updated with AMP and
     gradient clipping.  During validation the model runs in eval mode with
     no gradient computation.
-    Parameters
-    ----------
-    mode_idx : Tensor, optional
-        0-based label-column indices selecting/ordering `label_mean`/`label_std`
-        to match the (already column-selected) labels returned by the dataset.
-        If None, use all columns from labels.
-    accumulate_every : int
-        Number of consecutive batches/examples to accumulate gradients over
-        before each optimizer step.  1 (default) steps every batch, matching
-        prior behaviour for all non-RODCNN models.  For RODCNN, the loader
-        yields one example per iteration (see `train()`), so this is the
-        gradient-accumulation window in "examples per optimizer step".
-    Loss
-    ----
-    L2 (MSE) on z-scored Zernike labels.  Physical-unit metrics (WFE rms, Strehl proxy)
-    are computed after denormalising predictions.
     """
     is_rodcnn = model_type.lower() == 'rodcnn'
     model.train(is_train)
@@ -221,14 +207,13 @@ def _run_epoch(
     with ctx:
         for batch_idx, batch in enumerate(loader):
             if is_rodcnn:
-                # One example per iteration: I1/I2 are [T,H,W] (see train()).
-                I1 = batch['I1'].to(device, non_blocking=True).unsqueeze(1)  # [T,1,H,W]
-                I2 = batch['I2'].to(device, non_blocking=True).unsqueeze(1)  # [T,1,H,W]
-                labels = batch['labels'].to(device, non_blocking=True)      # [n_outputs]
+                I1 = batch['I1'].to(device, non_blocking=True)
+                I2 = batch['I2'].to(device, non_blocking=True)
+                labels = batch['labels'].to(device, non_blocking=True)  # [B, n_outputs]
+                k_p = k_pairs_train if is_train else None
                 with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                    pred_all = model(I1, I2)              # [T², n_outputs]
-                    pred     = pred_all.mean(dim=0)        # [n_outputs]
-                    loss     = criterion(pred, labels) / accumulate_every
+                    pred = model(I1, I2, k_pairs=k_p)                  # [B, n_outputs]
+                    loss = criterion(pred, labels) / accumulate_every
             else:
                 I1 = batch['I1'].to(device, non_blocking=True)
                 I2 = batch['I2'].to(device, non_blocking=True)
@@ -270,25 +255,23 @@ def _run_epoch(
             total_loss += loss.detach() * accumulate_every
 
             # accumulate detached predictions on GPU for physical metrics
-            if is_rodcnn:
-                all_pred.append(pred.detach().unsqueeze(0))
-                all_target.append(labels.detach().unsqueeze(0))
-            else:
-                all_pred.append(pred.detach())
-                all_target.append(labels.detach())
+            all_pred.append(pred.detach())
+            all_target.append(labels.detach())
 
             # Intermediate logging
             elapsed = time.time() - t0
-            batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
-            remaining_batches = len(loader) - (batch_idx + 1)
-            eta_sec = remaining_batches / batches_per_sec if batches_per_sec > 0 else 0
-            
-            phase = "train" if is_train else "val"
             if log_interval > 0 and (batch_idx + 1) % log_interval == 0:
                 avg_loss = (total_loss / (batch_idx + 1)).item()
+                batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+                n_examples_done = (batch_idx + 1) * labels.shape[0]
+                ex_per_sec = n_examples_done / elapsed if elapsed > 0 else 0
+                remaining_batches = len(loader) - (batch_idx + 1)
+                eta_sec = remaining_batches / batches_per_sec if batches_per_sec > 0 else 0
+
+                phase = "train" if is_train else "val"
                 print(f"  [{phase}] batch {batch_idx+1:4d}/{len(loader)}  "
                       f"loss={avg_loss:.4f}  "
-                      f"time={elapsed:6.0f}s  eta={eta_sec:5.0f}s", end="")
+                      f"time={elapsed:6.0f}s  rate={ex_per_sec:5.1f} ex/s  eta={eta_sec:5.0f}s", end="")
                 if is_train:
                     lr = scheduler.get_last_lr()[0]
                     print(f"  lr={lr:.2e}", end="")
@@ -417,34 +400,25 @@ def train(cfg: dict) -> None:
                            preload=preload)
 
     n_workers = dc.get('num_workers', 4)
-    batch_size = dc.get('batch_size', 64)
-    if is_rodcnn:
-        # batch_size is repurposed as the gradient-accumulation window
-        # (examples per optimizer step).  The loader yields one example
-        # (all T frames) per iteration -- no collation, so I1/I2 keep their
-        # natural [T,H,W] shape (no cross-example mixing).
-        train_loader = DataLoader(
-            train_ds, batch_size=None, sampler=RandomSampler(train_ds),
-            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
-        )
-        val_loader = DataLoader(
-            val_ds, batch_size=None, sampler=SequentialSampler(val_ds),
-            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
-        )
-    else:
-        train_loader = DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True,
-            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
-        )
-        val_loader = DataLoader(
-            val_ds, batch_size=batch_size * 2, shuffle=False,
-            num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
-        )
+    batch_size = dc.get('batch_size', 4 if is_rodcnn else 64)
+    accumulate_every = tc.get('accumulate_every', 1)
+    k_pairs_train = mc.get('k_pairs_train', dc.get('k_pairs_train', 16))
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size if is_rodcnn else batch_size * 2, shuffle=False,
+        num_workers=n_workers, pin_memory=True, persistent_workers=(n_workers > 0),
+    )
 
     # ── model ─────────────────────────────────────────────────────────
     model = build_model(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model: {mc['type']}  ({n_params:.2f} M parameters)")
+    if is_rodcnn:
+        print(f"RODCNN config: batch_size={batch_size}, k_pairs_train={k_pairs_train}, accumulate_every={accumulate_every}")
 
     # ── compile (JIT) ─────────────────────────────────────────────────
     compile_mode = tc.get('compile_mode', 'reduce-overhead')
@@ -465,7 +439,7 @@ def train(cfg: dict) -> None:
     )
     epochs       = tc['epochs']
     warmup_steps = tc.get('warmup_steps', 500)
-    steps_per_epoch = math.ceil(len(train_loader) / batch_size) if is_rodcnn else len(train_loader)
+    steps_per_epoch = math.ceil(len(train_loader) / accumulate_every)
     total_steps  = epochs * steps_per_epoch
     # scheduler = torch.optim.lr_scheduler.LambdaLR(
     #     optimizer,
@@ -513,6 +487,16 @@ def train(cfg: dict) -> None:
     print(f"  Checkpoints  {lc['checkpoint_dir']}")
     print(f"{'─'*60}")
 
+    # ── sparse recorder ───────────────────────────────────────────────
+    recorder = None
+    if lc.get('sparse_record', True):
+        recorder = SparseRecorder(
+            task_name=f"train_{mc['type']}",
+            output_dir=lc.get('sparse_dir', None),
+            config=cfg,
+        )
+        print(f"HPC Sparse Recording initialized: {recorder.filepath}")
+
     # ── warm-up data loaders ──────────────────────────────────────────
     if False:
         print("Warming up data loaders...")
@@ -523,74 +507,116 @@ def train(cfg: dict) -> None:
     # ── training loop ─────────────────────────────────────────────────
     best_val_wfe = float('inf')
     t_train_start = time.time()
-    for epoch in range(1, epochs + 1):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch}/{epochs}")
-        print('='*60)
+    try:
+        for epoch in range(1, epochs + 1):
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch}/{epochs}")
+            print('='*60)
 
-        t_epoch = time.time()
-        train_metrics = _run_epoch(
-            model, train_loader, optimizer, scaler, scheduler, device,
-            label_std, label_mean,
-            grad_clip=tc.get('grad_clip', 1.0),
-            log_interval=lc.get('log_interval', 100),
-            is_train=True,
-            mode_idx=mode_idx if subset_mode else None,
-            model_type=mc['type'],
-            accumulate_every=batch_size if is_rodcnn else 1,
-        )
-        val_metrics = _run_epoch(
-            model, val_loader, optimizer, scaler, scheduler, device,
-            label_std, label_mean,
-            grad_clip=tc.get('grad_clip', 1.0),
-            log_interval=0,
-            is_train=False,
-            mode_idx=mode_idx if subset_mode else None,
-            model_type=mc['type'],
-            accumulate_every=batch_size if is_rodcnn else 1,
-        )
-        epoch_elapsed = time.time() - t_epoch
+            t_epoch = time.time()
+            train_metrics = _run_epoch(
+                model, train_loader, optimizer, scaler, scheduler, device,
+                label_std, label_mean,
+                grad_clip=tc.get('grad_clip', 1.0),
+                log_interval=lc.get('log_interval', 100),
+                is_train=True,
+                mode_idx=mode_idx if subset_mode else None,
+                model_type=mc['type'],
+                accumulate_every=accumulate_every,
+                k_pairs_train=k_pairs_train,
+            )
+            val_metrics = _run_epoch(
+                model, val_loader, optimizer, scaler, scheduler, device,
+                label_std, label_mean,
+                grad_clip=tc.get('grad_clip', 1.0),
+                log_interval=0,
+                is_train=False,
+                mode_idx=mode_idx if subset_mode else None,
+                model_type=mc['type'],
+                accumulate_every=1,
+                k_pairs_train=None,
+            )
+            epoch_elapsed = time.time() - t_epoch
 
-        print(f"  Train loss={train_metrics['loss']:.4f}  "
-              f"WFE={train_metrics['wfe_rms']*1e9:.1f} nm  "
-              f"Strehl={train_metrics['strehl']:.3f}")
-        print(f"  Val   loss={val_metrics['loss']:.4f}  "
-              f"WFE={val_metrics['wfe_rms']*1e9:.1f} nm  "
-              f"Strehl={val_metrics['strehl']:.3f}  "
-              f"[{epoch_elapsed:.0f}s]")
-        subset_note = " [subset mode]" if subset_mode else ""
-        print(f"  Per-mode val RMS (nm):{subset_note}")
-        for i, rms in enumerate(val_metrics['mode_rms']):
-            mode_j = trained_modes[i]
-            name = NOLL_MODE_NAMES.get(mode_j, f"Z{mode_j}")
-            print(f"    {name:<28s} {rms*1e9:6.1f}")
+            print(f"  Train loss={train_metrics['loss']:.4f}  "
+                  f"WFE={train_metrics['wfe_rms']*1e9:.1f} nm  "
+                  f"Strehl={train_metrics['strehl']:.3f}")
+            print(f"  Val   loss={val_metrics['loss']:.4f}  "
+                  f"WFE={val_metrics['wfe_rms']*1e9:.1f} nm  "
+                  f"Strehl={val_metrics['strehl']:.3f}  "
+                  f"[{epoch_elapsed:.0f}s]")
+            subset_note = " [subset mode]" if subset_mode else ""
+            print(f"  Per-mode val RMS (nm):{subset_note}")
+            for i, rms in enumerate(val_metrics['mode_rms']):
+                mode_j = trained_modes[i]
+                name = NOLL_MODE_NAMES.get(mode_j, f"Z{mode_j}")
+                print(f"    {name:<28s} {rms*1e9:6.1f}")
 
-        val_wfe = val_metrics['wfe_rms']
-        if val_wfe < best_val_wfe - es_min_delta:
-            best_val_wfe = val_wfe
-            es_counter   = 0
-            ckpt_state = {
-                'epoch':       epoch,
-                'model_state': model.state_dict(),
-                'optim_state': optimizer.state_dict(),
-                'val_wfe_rms': val_wfe,
-                'label_mean':  label_mean.numpy(),
-                'label_std':   label_std.numpy(),
-                'config':      deepcopy(cfg),
-            }
-            ckpt_mgr.save(ckpt_state, val_wfe, epoch)
-            print(f"  *** New best val WFE: {val_wfe*1e9:.1f} nm — checkpoint saved ***")
-        else:
-            es_counter += 1
-            print(f"  No improvement ({es_counter}/{es_patience})")
+            val_wfe = val_metrics['wfe_rms']
+            if val_wfe < best_val_wfe - es_min_delta:
+                best_val_wfe = val_wfe
+                es_counter   = 0
+                raw_model = getattr(model, '_orig_mod', model)
+                ckpt_state = {
+                    'epoch':       epoch,
+                    'model_state': raw_model.state_dict(),
+                    'optim_state': optimizer.state_dict(),
+                    'val_wfe_rms': val_wfe,
+                    'label_mean':  label_mean.numpy(),
+                    'label_std':   label_std.numpy(),
+                    'config':      deepcopy(cfg),
+                }
+                ckpt_mgr.save(ckpt_state, val_wfe, epoch)
+                saved_path = str(ckpt_mgr.dir / f"epoch{epoch:03d}_wfe{val_wfe*1e9:.1f}nm.pt")
+                print(f"  *** New best val WFE: {val_wfe*1e9:.1f} nm — checkpoint saved ***")
+                if recorder is not None:
+                    recorder.record_checkpoint(
+                        epoch=epoch,
+                        metric_name="val_wfe_rms",
+                        metric_val=val_wfe * 1e9,
+                        checkpoint_path=saved_path,
+                    )
+            else:
+                es_counter += 1
+                print(f"  No improvement ({es_counter}/{es_patience})")
+
+            if recorder is not None:
+                recorder.record_step(
+                    step=f"{epoch}/{epochs}",
+                    metrics={
+                        'train_loss': train_metrics['loss'],
+                        'train_wfe_nm': train_metrics['wfe_rms'] * 1e9,
+                        'train_strehl': train_metrics['strehl'],
+                        'val_loss': val_metrics['loss'],
+                        'val_wfe_nm': val_metrics['wfe_rms'] * 1e9,
+                        'val_strehl': val_metrics['strehl'],
+                    },
+                    phase="train",
+                    step_name="epoch",
+                    epoch_time_s=epoch_elapsed,
+                    lr=optimizer.param_groups[0]['lr'],
+                )
+
             if es_counter >= es_patience:
                 print(f"  Early stopping triggered after {epoch} epochs.")
+                if recorder is not None:
+                    recorder.log_message(f"Early stopping triggered after {epoch} epochs.")
                 break
 
-    total_elapsed = time.time() - t_train_start
-    print(f"\nTraining complete.  Best val WFE: {best_val_wfe*1e9:.1f} nm  "
-          f"(total {total_elapsed/60:.1f} min)")
-    print(f"Best checkpoint: {ckpt_mgr.best_path()}")
+        total_elapsed = time.time() - t_train_start
+        print(f"\nTraining complete.  Best val WFE: {best_val_wfe*1e9:.1f} nm  "
+              f"(total {total_elapsed/60:.1f} min)")
+        print(f"Best checkpoint: {ckpt_mgr.best_path()}")
+
+        if recorder is not None:
+            recorder.log_message(f"Training complete. Best val WFE: {best_val_wfe*1e9:.1f} nm. Best checkpoint: {ckpt_mgr.best_path()}")
+            recorder.close(status="COMPLETED")
+
+    except Exception as e:
+        if recorder is not None:
+            recorder.log_message(f"[ERROR] Training aborted with exception: {e}")
+            recorder.close(status=f"FAILED ({type(e).__name__})")
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -603,6 +629,10 @@ def _parse_args():
                         help="Path to YAML config file (e.g. config/transformer.yaml)")
     parser.add_argument('--hdf5_path', default=None,
                         help="Path to the HDF5 training dataset (overrides config)")
+    parser.add_argument('--sparse_dir', default=None,
+                        help="Directory for sparse HPC logs (defaults to nn_WFS/tmp)")
+    parser.add_argument('--no_sparse_record', action='store_true',
+                        help="Disable sparse HPC log recording")
     # absorb arbitrary key=value overrides
     args, overrides = parser.parse_known_args()
     return args, overrides
@@ -614,6 +644,11 @@ if __name__ == '__main__':
 
     if args.hdf5_path:
         overrides.append(f'data.hdf5_path={args.hdf5_path}')
+    if args.sparse_dir:
+        overrides.append(f'logging.sparse_dir={args.sparse_dir}')
+    if args.no_sparse_record:
+        overrides.append('logging.sparse_record=false')
 
     cfg = _apply_overrides(cfg, overrides)
     train(cfg)
+

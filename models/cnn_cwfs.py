@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from typing import Optional
 
 try:
     from .common import CrossAttentionBlock, MLPHead, encode_and_pool, RoddierSignal
@@ -310,28 +311,74 @@ class RODCNN(nn.Module):
         self,
         I1: torch.Tensor,
         I2: torch.Tensor,
+        k_pairs: Optional[int] = None,
+        return_all_pairs: bool = False,
     ) -> torch.Tensor:
         """
         Parameters
         ----------
-        I1 : Tensor[B, 1, H, W]  — intra-focal mean PSFs (same mirror state)
-        I2 : Tensor[B, 1, H, W]  — extra-focal mean PSFs (same mirror state)
+        I1 : Tensor[B, T, 1, H, W] or [T, 1, H, W] or [B, T, H, W]
+            Intra-focal frame stacks.
+        I2 : Tensor[B, T, 1, H, W] or [T, 1, H, W] or [B, T, H, W]
+            Extra-focal frame stacks.
+        k_pairs : int, optional
+            Number of (I1_i, I2_j) pairs to randomly subsample per example.
+            Only applied during training (self.training=True).
+            If None or during evaluation, evaluates all T² combinations.
+        return_all_pairs : bool
+            If True, returns [B, K, n_outputs] before averaging over pairs.
+            If False (default), returns [B, n_outputs].
 
         Returns
         -------
-        Tensor[B², n_outputs]  — one prediction per (I1_i, I2_j) combination
+        Tensor[B, n_outputs] (or [B, K, n_outputs] if return_all_pairs=True)
         """
-        B, C, H, W = I1.shape
-        # Vectorised B² expansion: pair every I1_i with every I2_j
-        I1_rep = I1.unsqueeze(1).expand(B, B, C, H, W).reshape(B * B, C, H, W)
-        I2_rep = I2.unsqueeze(0).expand(B, B, C, H, W).reshape(B * B, C, H, W)
-        r_all  = self.roddier(I1_rep, I2_rep)              # [B², 1, H, W]
+        # Standardise input to [B, T, 1, H, W]
+        if I1.dim() == 3:  # [T, H, W]
+            I1 = I1.unsqueeze(0).unsqueeze(2)
+            I2 = I2.unsqueeze(0).unsqueeze(2)
+        elif I1.dim() == 4:
+            if I1.shape[1] == 1:  # [T, 1, H, W]
+                I1 = I1.unsqueeze(0)
+                I2 = I2.unsqueeze(0)
+            else:  # [B, T, H, W]
+                I1 = I1.unsqueeze(2)
+                I2 = I2.unsqueeze(2)
 
-        feat           = self.backbone(r_all)              # [B², dim, Hp, Wp]
-        B2, ch, Hp, Wp = feat.shape
-        tokens         = feat.view(B2, ch, Hp * Wp).transpose(1, 2)  # [B², N, ch]
-        pooled         = tokens.mean(dim=1)                           # [B², ch]
-        return self.head(pooled)                                       # [B², n_outputs]
+        B, T, C, H, W = I1.shape
+        use_subsample = (self.training and k_pairs is not None and k_pairs < T * T)
+
+        if use_subsample:
+            # Sample k_pairs random (i, j) frame index pairs per example
+            idx_i = torch.randint(0, T, (B, k_pairs), device=I1.device)
+            idx_j = torch.randint(0, T, (B, k_pairs), device=I2.device)
+            batch_idx = torch.arange(B, device=I1.device).unsqueeze(1).expand(B, k_pairs)
+
+            I1_sel = I1[batch_idx, idx_i]  # [B, k_pairs, 1, H, W]
+            I2_sel = I2[batch_idx, idx_j]  # [B, k_pairs, 1, H, W]
+
+            I1_flat = I1_sel.reshape(B * k_pairs, C, H, W)
+            I2_flat = I2_sel.reshape(B * k_pairs, C, H, W)
+            n_pairs_per_ex = k_pairs
+        else:
+            # Vectorised full T² expansion
+            I1_rep = I1.unsqueeze(2).expand(B, T, T, C, H, W).reshape(B * T * T, C, H, W)
+            I2_rep = I2.unsqueeze(1).expand(B, T, T, C, H, W).reshape(B * T * T, C, H, W)
+            I1_flat = I1_rep
+            I2_flat = I2_rep
+            n_pairs_per_ex = T * T
+
+        r_all = self.roddier(I1_flat, I2_flat)               # [B*K, 1, H, W]
+        feat = self.backbone(r_all)                          # [B*K, dim, Hp, Wp]
+        BK, ch, Hp, Wp = feat.shape
+        tokens = feat.view(BK, ch, Hp * Wp).transpose(1, 2)  # [B*K, N, ch]
+        pooled = tokens.mean(dim=1)                          # [B*K, ch]
+        preds_flat = self.head(pooled)                       # [B*K, n_outputs]
+
+        preds = preds_flat.view(B, n_pairs_per_ex, self.n_outputs)
+        if return_all_pairs:
+            return preds
+        return preds.mean(dim=1)  # [B, n_outputs]
 
     def predict(
         self,
@@ -339,21 +386,12 @@ class RODCNN(nn.Module):
         I2: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Inference helper: average predictions over the I2 axis per I1 query.
-
-        For each I1_i, Roddier signals are computed against all B available
-        I2_j and the mean prediction is returned — averaging out atmospheric
-        noise.  With B=1 (single matched pair) reduces to standard inference.
-
-        Parameters
-        ----------
-        I1 : Tensor[B, 1, H, W]
-        I2 : Tensor[B, 1, H, W]
-
-        Returns
-        -------
-        Tensor[B, n_outputs]  — one averaged prediction per I1 query
+        Inference helper: average predictions over all T² available pairs.
         """
-        B   = I1.shape[0]
-        raw = self.forward(I1, I2)                              # [B², n_outputs]
-        return raw.reshape(B, B, self.n_outputs).mean(dim=1)   # [B, n_outputs]
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            out = self.forward(I1, I2, k_pairs=None, return_all_pairs=False)
+        if was_training:
+            self.train()
+        return out
