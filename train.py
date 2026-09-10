@@ -293,10 +293,12 @@ def _run_epoch(
     strehl    = strehl_proxy(torch.tensor(wfe_rms)).item()
 
     return {
-        'loss':     (total_loss / len(loader)).item(),
-        'wfe_rms':  wfe_rms,
-        'strehl':   strehl,
-        'mode_rms': mode_rms.tolist(),
+        'loss':        (total_loss / len(loader)).item(),
+        'wfe_rms':     wfe_rms,
+        'strehl':      strehl,
+        'mode_rms':    mode_rms.tolist(),
+        'last_pred':   all_pred[-1].numpy(),
+        'last_target': all_target[-1].numpy(),
     }
 
 
@@ -562,6 +564,17 @@ def train(cfg: dict) -> None:
                 mode_j = trained_modes[i]
                 name = NOLL_MODE_NAMES.get(mode_j, f"Z{mode_j}")
                 print(f"    {name:<28s} {rms*1e9:6.1f}")
+
+            # Save validation pupil reconstruction figure to test folder
+            if recorder is not None and 'last_pred' in val_metrics:
+                fig_path = recorder.save_pupil_reconstruction(
+                    epoch=epoch,
+                    c_true=val_metrics['last_target'],
+                    c_pred=val_metrics['last_pred'],
+                    trained_modes=trained_modes,
+                )
+                if fig_path:
+                    print(f"  Pupil figure saved: {Path(fig_path).name}")
 
             val_wfe = val_metrics['wfe_rms']
             if val_wfe < best_val_wfe - es_min_delta:
