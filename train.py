@@ -21,6 +21,8 @@ import heapq
 import inspect
 import math
 import os
+import signal
+import subprocess
 import sys
 import time
 from copy import deepcopy
@@ -325,6 +327,28 @@ def _format_mode_list(trained_modes: list[int]) -> str:
     return ",".join(f"Z{m}" for m in trained_modes)
 
 
+def _cleanup_orphaned_processes() -> None:
+    """Terminate orphaned DataLoader or Inductor worker processes left by previous crashed runs."""
+    try:
+        current_pid = os.getpid()
+        user = os.environ.get("USER", "")
+        cmd = ["ps", "-u", user, "-o", "pid,ppid,cmd"] if user else ["ps", "-o", "pid,ppid,cmd"]
+        out = subprocess.check_output(cmd, text=True, errors="replace")
+        for line in out.splitlines():
+            if ("multiprocessing.forkserver" in line or "torch._inductor.compile_worker" in line) and "ps" not in line:
+                parts = line.strip().split(None, 2)
+                if len(parts) >= 2:
+                    pid = int(parts[0])
+                    ppid = int(parts[1])
+                    if pid != current_pid and (ppid == 1 or not os.path.exists(f"/proc/{ppid}")):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+    except Exception:
+        pass
+
+
 def train(cfg: dict) -> None:
     """
     Full training run as specified by cfg.
@@ -333,6 +357,8 @@ def train(cfg: dict) -> None:
     ----------
     cfg : dict — config dict (typically loaded from a YAML file)
     """
+    _cleanup_orphaned_processes()
+
     dc  = cfg['data']
     tc  = cfg['training']
     lc  = cfg['logging']
