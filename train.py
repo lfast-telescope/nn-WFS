@@ -192,6 +192,8 @@ def _run_epoch(
     all_pred   = []
     all_target = []
     t0 = time.time()
+    t_last = t0
+    last_batch = 0
 
     # Prepare label stats, selecting the same columns/order as the dataset
     lm = label_mean.to(device)
@@ -268,10 +270,16 @@ def _run_epoch(
                 remaining_batches = len(loader) - (batch_idx + 1)
                 eta_sec = remaining_batches / batches_per_sec if batches_per_sec > 0 else 0
 
+                dt_window = time.time() - t_last
+                d_ex = (batch_idx + 1 - last_batch) * labels.shape[0]
+                inst_rate = d_ex / dt_window if dt_window > 0 else ex_per_sec
+                t_last = time.time()
+                last_batch = batch_idx + 1
+
                 phase = "train" if is_train else "val"
                 print(f"  [{phase}] batch {batch_idx+1:4d}/{len(loader)}  "
                       f"loss={avg_loss:.4f}  "
-                      f"time={elapsed:6.0f}s  rate={ex_per_sec:5.1f} ex/s  eta={eta_sec:5.0f}s", end="")
+                      f"time={elapsed:6.0f}s  rate={ex_per_sec:5.1f} ex/s (inst={inst_rate:5.1f})  eta={eta_sec:5.0f}s", end="")
                 if is_train:
                     lr = scheduler.get_last_lr()[0]
                     print(f"  lr={lr:.2e}", end="")
@@ -525,8 +533,11 @@ def train(cfg: dict) -> None:
                 accumulate_every=accumulate_every,
                 k_pairs_train=k_pairs_train,
             )
+            # Use raw uncompiled model for validation to avoid compiling a second 256-pair
+            # inference graph that invalidates the 64-pair training graph across epoch boundaries
+            raw_model = getattr(model, '_orig_mod', model)
             val_metrics = _run_epoch(
-                model, val_loader, optimizer, scaler, scheduler, device,
+                raw_model, val_loader, optimizer, scaler, scheduler, device,
                 label_std, label_mean,
                 grad_clip=tc.get('grad_clip', 1.0),
                 log_interval=0,
