@@ -46,6 +46,9 @@ matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+
+from utils.sparse_recorder import SparseRecorder
 
 try:
     from hcipy import (
@@ -535,80 +538,106 @@ def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
     if chunk > n_total/2:
         chunk = max(1,n_total/4)
 
-    with h5py.File(out_path, 'w') as f:
-        ds_psfs = f.create_dataset(
-            'psfs',
-            shape=(n_total, 2, t_frames, img_size, img_size),
-            dtype='float16',
-            chunks=(chunk, 2, t_frames, img_size, img_size),
-            compression='gzip', compression_opts=4,
-        )
-        ds_labels = f.create_dataset(
-            'labels',
-            shape=(n_total, n_modes),
-            dtype='float32',
-            chunks=(chunk, n_modes),
-        )
-        ds_labels.attrs['label_units'] = cfg.output.label_units
-        ds_labels.attrs['noll_start']  = 1
-        ds_labels.attrs['n_modes']     = n_modes
-        f.attrs['config'] = json.dumps(dict(cfg), default=str)
+    recorder = None
+    if not dry_run and not getattr(cfg, 'no_sparse_record', False):
+        sparse_dir = getattr(cfg, 'sparse_dir', None)
+        recorder = SparseRecorder(task_name="data_generation", output_dir=sparse_dir, config=dict(cfg))
+        print(f"HPC Sparse Recording initialized: {recorder.filepath}")
 
-        row = 0
-        t0  = time.time()
-        last_time = time.time()
-
-        for ex_idx in range(n_examples):
-            start_time = time.time()
-            labels_ex  = draw_coefficients(cfg, rng)
-            
-            mirror_opd = sum(float(c) * m for c, m in zip(labels_ex, zernike_basis))
-
-            atm = reset_atm_seed(atm)
-            I1m = propagate_polychromatic(
-                mirror_opd, +1.0, defocus_opd_unit, c4_defocus,
-                cfg, aperture, prop, pupil_grid,
-                wavelengths, weights, img_size,
-                atm,
+    try:
+        with h5py.File(out_path, 'w') as f:
+            ds_psfs = f.create_dataset(
+                'psfs',
+                shape=(n_total, 2, t_frames, img_size, img_size),
+                dtype='float16',
+                chunks=(chunk, 2, t_frames, img_size, img_size),
+                compression='gzip', compression_opts=4,
             )
-            atm = reset_atm_seed(atm)
-            I2m = np.rot90(propagate_polychromatic(
-                mirror_opd, -1.0, defocus_opd_unit, c4_defocus,
-                cfg, aperture, prop, pupil_grid,
-                wavelengths, weights, img_size,
-                atm,
-            ), k=2)
+            ds_labels = f.create_dataset(
+                'labels',
+                shape=(n_total, n_modes),
+                dtype='float32',
+                chunks=(chunk, n_modes),
+            )
+            ds_labels.attrs['label_units'] = cfg.output.label_units
+            ds_labels.attrs['noll_start']  = 1
+            ds_labels.attrs['n_modes']     = n_modes
+            f.attrs['config'] = json.dumps(dict(cfg), default=str)
 
-            tmpname = os.path.join(os.getcwd(),'tmp')
-            avgsize = 3
-            R = (np.mean(I1m[:avgsize],0)-np.mean(I2m[:avgsize],0))/(np.mean(I1m[:avgsize],0)+np.mean(I2m[:avgsize],0)+1e-6)
-            os.makedirs(tmpname, exist_ok=True)
-            plt.imshow(gaussian_filter(R,1))
-            plt.colorbar()
-            plt.title(f"idx:{ex_idx} time: {time.time()-start_time}s")
-            plt.savefig(os.path.join(tmpname,'debug_fig.png'))
-            plt.close()
+            row = 0
+            t0  = time.time()
+            last_time = time.time()
 
-            ds_psfs[row, 0]  = I1m.astype(np.float16)
-            ds_psfs[row, 1]  = I2m.astype(np.float16)
-            ds_labels[row]   = labels_ex.astype(np.float32)
-            row += 1
-            f.flush()
+            for ex_idx in range(n_examples):
+                start_time = time.time()
+                labels_ex  = draw_coefficients(cfg, rng)
+                
+                mirror_opd = sum(float(c) * m for c, m in zip(labels_ex, zernike_basis))
 
-            if (ex_idx % 2) == 0 or ex_idx == n_examples - 1:
-                elapsed = time.time() - t0
-                interval = time.time() - last_time
-                last_time = time.time()
-                done    = row
-                rate    = done / elapsed if elapsed > 0 else 0
-                eta_seconds     = (n_total - done) / rate if rate > 0 else float('inf')
-                eta_td  = timedelta(seconds=int(eta_seconds))
-                print(f"  [{done:>{len(str(n_total))}}/{n_total}]  "
-                    f"{int(elapsed):>5}s  {interval:5.1f}s  {rate:.2f} ex/s  ETA {str(eta_td)}")
+                atm = reset_atm_seed(atm)
+                I1m = propagate_polychromatic(
+                    mirror_opd, +1.0, defocus_opd_unit, c4_defocus,
+                    cfg, aperture, prop, pupil_grid,
+                    wavelengths, weights, img_size,
+                    atm,
+                )
+                atm = reset_atm_seed(atm)
+                I2m = np.rot90(propagate_polychromatic(
+                    mirror_opd, -1.0, defocus_opd_unit, c4_defocus,
+                    cfg, aperture, prop, pupil_grid,
+                    wavelengths, weights, img_size,
+                    atm,
+                ), k=2)
 
-        print(f"\nDone.  HDF5: {out_path}")
-        print(f"  {'psfs':<8} {str(ds_psfs.shape):<18} float16")
-        print(f"  {'labels':<8} {str(ds_labels.shape):<18} float32")
+                tmpname = os.path.join(os.getcwd(),'tmp')
+                avgsize = 3
+                R = (np.mean(I1m[:avgsize],0)-np.mean(I2m[:avgsize],0))/(np.mean(I1m[:avgsize],0)+np.mean(I2m[:avgsize],0)+1e-6)
+                os.makedirs(tmpname, exist_ok=True)
+                plt.imshow(gaussian_filter(R,1))
+                plt.colorbar()
+                plt.title(f"idx:{ex_idx} time: {time.time()-start_time}s")
+                plt.savefig(os.path.join(tmpname,'debug_fig.png'))
+                plt.close()
+
+                ds_psfs[row, 0]  = I1m.astype(np.float16)
+                ds_psfs[row, 1]  = I2m.astype(np.float16)
+                ds_labels[row]   = labels_ex.astype(np.float32)
+                row += 1
+                f.flush()
+
+                if (ex_idx % 2) == 0 or ex_idx == n_examples - 1:
+                    elapsed = time.time() - t0
+                    interval = time.time() - last_time
+                    last_time = time.time()
+                    done    = row
+                    rate    = done / elapsed if elapsed > 0 else 0
+                    eta_seconds     = (n_total - done) / rate if rate > 0 else float('inf')
+                    eta_td  = timedelta(seconds=int(eta_seconds))
+                    print(f"  [{done:>{len(str(n_total))}}/{n_total}]  "
+                        f"{int(elapsed):>5}s  {interval:5.1f}s  {rate:.2f} ex/s  ETA {str(eta_td)}")
+
+                    if recorder is not None and ((ex_idx % 10 == 0) or (ex_idx == n_examples - 1)):
+                        recorder.record_step(
+                            step=f"{done}/{n_total}",
+                            metrics={"rate_ex_per_sec": rate, "eta_sec": eta_seconds},
+                            phase="gen",
+                            step_name="example",
+                            elapsed_s=int(elapsed),
+                        )
+
+            print(f"\nDone.  HDF5: {out_path}")
+            print(f"  {'psfs':<8} {str(ds_psfs.shape):<18} float16")
+            print(f"  {'labels':<8} {str(ds_labels.shape):<18} float32")
+
+            if recorder is not None:
+                recorder.log_message(f"Generation complete: {n_total} examples saved to {out_path}")
+                recorder.close(status="COMPLETED")
+
+    except Exception as e:
+        if recorder is not None:
+            recorder.log_message(f"[ERROR] Data generation aborted with exception: {e}")
+            recorder.close(status=f"FAILED ({type(e).__name__})")
+        raise
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -626,10 +655,18 @@ if __name__ == '__main__':
                         help='Override output HDF5 path from config.')
     parser.add_argument('--dry-run',  action='store_true',
                         help='Generate 2 examples and print shapes, no HDF5 written.')
+    parser.add_argument('--sparse_dir', default=None,
+                        help='Directory for sparse HPC logs (defaults to nn_WFS/tmp).')
+    parser.add_argument('--no_sparse_record', action='store_true',
+                        help='Disable sparse HPC logging.')
 
     args, overrides = parser.parse_known_args()
     cfg = load_config(args.config)
     apply_overrides(cfg, overrides)
+    if args.sparse_dir:
+        cfg.sparse_dir = args.sparse_dir
+    if args.no_sparse_record:
+        cfg.no_sparse_record = True
     main(cfg, output_path=args.output, dry_run=args.dry_run)
 
 

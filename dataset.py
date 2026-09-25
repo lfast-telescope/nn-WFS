@@ -1,3 +1,5 @@
+from typing import Optional, cast, Union, Tuple, List
+import math
 import numpy as np
 import h5py
 import torch
@@ -5,6 +7,85 @@ from torch.utils.data import Dataset
 
 # Roddier signal stabilisation constant
 EPS_RODDIER = 1e-6
+
+
+def apply_detector_noise(
+    I: torch.Tensor,
+    T: int,
+    noise_cfg: Optional[dict],
+    is_train: bool,
+    sample_id: int,
+    stream_id: int = 0,
+) -> torch.Tensor:
+    """
+    Inject Poisson photon shot noise and Gaussian readout noise on-the-fly.
+
+    Parameters
+    ----------
+    I : torch.Tensor
+        PSF tensor of shape [1, H, W] (pair mode) or [T, H, W] (stack mode).
+        In the consolidated dataset, sum across all T frames is ~1.0 (each frame sum ~ 1/T).
+    T : int
+        Number of frames in sequence.
+    noise_cfg : dict or None
+        Configuration dict with keys:
+          'enabled' (bool): whether noise injection is active
+          'photons_per_frame' (float, alias 'photons_per_image'): N_ph per 2D frame
+          'read_noise_e' (float): Gaussian read noise std in electrons (default 0.0)
+          'seed' (int): base seed for deterministic val/test noise
+    is_train : bool
+        If True, samples stochastic noise independently across calls.
+        If False, uses deterministic generator seeded with (base_seed, sample_id, stream_id).
+    sample_id : int
+        Unique sample index for deterministic seeding in eval mode.
+    stream_id : int
+        0 for I1 (intra), 1 for I2 (extra), ensures distinct noise realizations.
+
+    Returns
+    -------
+    torch.Tensor with same shape and dtype as I.
+    """
+    if noise_cfg is None or not noise_cfg.get('enabled', False):
+        return I
+
+    n_ph = float(noise_cfg.get('photons_per_frame', noise_cfg.get('photons_per_image', 1e6)))
+    if n_ph <= 0 or math.isinf(n_ph):
+        return I
+
+    read_noise_e = float(noise_cfg.get('read_noise_e', 0.0))
+    base_seed = int(noise_cfg.get('seed', 42))
+
+    orig_dtype = I.dtype
+    orig_device = I.device
+    I_float = I.to(torch.float32)
+
+    # Scale frame to unit total flux: each frame sums to ~1.0
+    scale_to_unit = float(max(1, T))
+    I_unit = I_float * scale_to_unit
+
+    # Expected photon count per pixel
+    mu = torch.clamp(I_unit * n_ph, min=0.0)
+
+    if is_train:
+        # Stochastic training noise
+        noisy_counts = torch.poisson(mu)
+        if read_noise_e > 0.0:
+            noisy_counts = noisy_counts + torch.randn_like(mu) * read_noise_e
+    else:
+        # Deterministic validation / test noise
+        det_seed = int((base_seed * 1000003 + sample_id * 7919 + stream_id * 31 + 17) & 0x7FFFFFFF)
+        gen = torch.Generator(device='cpu').manual_seed(det_seed)
+        noisy_counts = torch.poisson(mu.cpu(), generator=gen).to(orig_device)
+        if read_noise_e > 0.0:
+            noise_read = torch.randn(mu.shape, generator=gen, dtype=torch.float32).to(orig_device) * read_noise_e
+            noisy_counts = noisy_counts + noise_read
+
+    # Clamp to non-negative and scale back to original dataset intensity scale
+    noisy_counts = torch.clamp(noisy_counts, min=0.0)
+    noisy_unit = noisy_counts / n_ph
+    noisy_I = noisy_unit / scale_to_unit
+
+    return noisy_I.to(orig_dtype)
 
 
 class CWFSDataset(Dataset):
@@ -85,16 +166,21 @@ class CWFSDataset(Dataset):
 
     def __init__(self, hdf5_path, indices, label_stats=None, transform=None,
                  return_stacks=False, mode_columns=None, compute_r_stack=False,
-                 preload=False):
+                 preload=False, label_scale=1.0, noise_cfg=None, is_train=True):
         self.path = str(hdf5_path)
         self.indices = np.asarray(indices, dtype=np.int64)
         self.label_stats = label_stats
         self.transform = transform
         self.return_stacks = return_stacks
         self.compute_r_stack = compute_r_stack
+        self.label_scale = float(label_scale)
+        self.noise_cfg = noise_cfg
+        self.is_train = bool(is_train)
         # if set, select (and reorder) these 0-based label columns before augmentation
         self.mode_idx = torch.as_tensor(mode_columns, dtype=torch.long) if mode_columns is not None else None
         self._file = None          # opened lazily; one handle per DataLoader worker
+        self._psfs_ds: Optional[h5py.Dataset] = None
+        self._labels_ds: Optional[h5py.Dataset] = None
 
         # Detect schema and store T (frames per stream).
         with h5py.File(self.path, 'r') as f:
@@ -145,7 +231,16 @@ class CWFSDataset(Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state['_file'] = None
+        state['_psfs_ds'] = None
+        state['_labels_ds'] = None
         return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if 'noise_cfg' not in self.__dict__:
+            self.noise_cfg = None
+        if 'is_train' not in self.__dict__:
+            self.is_train = False
 
     def __len__(self):
         if self.return_stacks:
@@ -153,6 +248,9 @@ class CWFSDataset(Dataset):
         return len(self.indices) * self.T * self.T
 
     def __getitem__(self, idx):
+        noise_cfg = getattr(self, 'noise_cfg', None)
+        is_train = getattr(self, 'is_train', False)
+
         # ── Preloaded path: read from RAM, skip HDF5 entirely ──────────
         if self._psfs_mem is not None:
             if self.return_stacks:
@@ -162,6 +260,10 @@ class CWFSDataset(Dataset):
                 else:
                     I1 = torch.from_numpy(self._psfs_mem[idx, 0].astype(np.float32)).unsqueeze(0)
                     I2 = torch.from_numpy(self._psfs_mem[idx, 1].astype(np.float32)).unsqueeze(0)
+
+                sample_id = int(self.indices[idx])
+                I1 = apply_detector_noise(I1, self.T, noise_cfg, is_train, sample_id=sample_id, stream_id=0)
+                I2 = apply_detector_noise(I2, self.T, noise_cfg, is_train, sample_id=sample_id, stream_id=1)
 
                 sample = {'I1': I1, 'I2': I2}
 
@@ -190,8 +292,12 @@ class CWFSDataset(Dataset):
                     I1 = torch.from_numpy(self._psfs_mem[example_idx, 0].astype(np.float32)).unsqueeze(0)
                     I2 = torch.from_numpy(self._psfs_mem[example_idx, 1].astype(np.float32)).unsqueeze(0)
 
+                sample_id = int(self.indices[example_idx]) * (self.T * self.T) + (frame_i * self.T + frame_j if self._temporal else 0)
+                I1 = apply_detector_noise(I1, self.T, noise_cfg, is_train, sample_id=sample_id, stream_id=0)
+                I2 = apply_detector_noise(I2, self.T, noise_cfg, is_train, sample_id=sample_id + 1000000007, stream_id=1)
+
                 r = (I1 - I2) / (I1 + I2 + EPS_RODDIER)
-                labels = torch.from_numpy(self._labels_mem[example_idx].astype(np.float32))
+                labels = torch.from_numpy(self._labels_mem[example_idx].astype(np.float32)) * self.label_scale
                 sample = {'I1': I1, 'I2': I2, 'r': r}
 
             # shared label normalisation + mode selection
@@ -209,21 +315,24 @@ class CWFSDataset(Dataset):
         # ── Lazy HDF5 path (preload=False) ─────────────────────────────
         if self._file is None:
             self._file = h5py.File(self.path, 'r')
+            self._psfs_ds = cast(h5py.Dataset, self._file['psfs'])
+            self._labels_ds = cast(h5py.Dataset, self._file['labels'])
+        assert self._psfs_ds is not None
+        assert self._labels_ds is not None
 
         if self.return_stacks:
             # ── stack mode: one item per example, returns all T frames ──
             i = int(self.indices[idx])
+            psf_pair = self._psfs_ds[i].astype(np.float32)  # [2, T, H, W] or [2, H, W]
             if self._temporal:
-                I1 = torch.from_numpy(
-                    self._file['psfs'][i, 0].astype(np.float32)   # [T, H, W]
-                )
-                I2 = torch.from_numpy(
-                    self._file['psfs'][i, 1].astype(np.float32)   # [T, H, W]
-                )
+                I1 = torch.from_numpy(psf_pair[0])                   # [T, H, W]
+                I2 = torch.from_numpy(psf_pair[1])                   # [T, H, W]
             else:
-                psf_pair = self._file['psfs'][i].astype(np.float32)  # [2, H, W]
                 I1 = torch.from_numpy(psf_pair[0]).unsqueeze(0)      # [1, H, W]
                 I2 = torch.from_numpy(psf_pair[1]).unsqueeze(0)      # [1, H, W]
+
+            I1 = apply_detector_noise(I1, self.T, noise_cfg, is_train, sample_id=i, stream_id=0)
+            I2 = apply_detector_noise(I2, self.T, noise_cfg, is_train, sample_id=i, stream_id=1)
 
             sample = {'I1': I1, 'I2': I2}
 
@@ -236,8 +345,8 @@ class CWFSDataset(Dataset):
                 R = R.reshape(T * T, *R.shape[2:])                        # [T², H, W]
                 sample['R'] = R
 
-            raw_labels = self._file['labels'][i]
-            labels = torch.from_numpy(raw_labels.astype(np.float32))
+            raw_labels = self._labels_ds[i]
+            labels = torch.from_numpy(raw_labels.astype(np.float32)) * self.label_scale
             if self.label_stats is not None:
                 mean = torch.as_tensor(self.label_stats['mean'], dtype=torch.float32)
                 std  = torch.as_tensor(self.label_stats['std'],  dtype=torch.float32)
@@ -258,21 +367,25 @@ class CWFSDataset(Dataset):
             frame_j     = idx % T
             i = int(self.indices[example_idx])
             I1 = torch.from_numpy(
-                self._file['psfs'][i, 0, frame_i].astype(np.float32)
+                self._psfs_ds[i, 0, frame_i].astype(np.float32)
             ).unsqueeze(0)                                      # [1, H, W]
             I2 = torch.from_numpy(
-                self._file['psfs'][i, 1, frame_j].astype(np.float32)
+                self._psfs_ds[i, 1, frame_j].astype(np.float32)
             ).unsqueeze(0)                                      # [1, H, W]
         else:
             i = int(self.indices[idx])
-            psf_pair = self._file['psfs'][i].astype(np.float32) # [2, H, W]
+            psf_pair = self._psfs_ds[i].astype(np.float32)     # [2, H, W]
             I1 = torch.from_numpy(psf_pair[0]).unsqueeze(0)    # [1, H, W]
             I2 = torch.from_numpy(psf_pair[1]).unsqueeze(0)    # [1, H, W]
 
+        sample_id = i * (self.T * self.T) + (frame_i * self.T + frame_j if self._temporal else 0)
+        I1 = apply_detector_noise(I1, self.T, noise_cfg, is_train, sample_id=sample_id, stream_id=0)
+        I2 = apply_detector_noise(I2, self.T, noise_cfg, is_train, sample_id=sample_id + 1000000007, stream_id=1)
+
         r  = (I1 - I2) / (I1 + I2 + EPS_RODDIER)              # [1, H, W]
 
-        raw_labels = self._file['labels'][i]                    # [n_modes]
-        labels = torch.from_numpy(raw_labels.astype(np.float32))
+        raw_labels = self._labels_ds[i]                        # [n_modes]
+        labels = torch.from_numpy(raw_labels.astype(np.float32)) * self.label_scale
 
         if self.label_stats is not None:
             mean = torch.as_tensor(self.label_stats['mean'], dtype=torch.float32)
@@ -295,7 +408,12 @@ class CWFSDataset(Dataset):
 # Dataset utilities
 # ──────────────────────────────────────────────────────────────────────
 
-def train_val_test_split(hdf5_path, ratios=(0.80, 0.10, 0.10), seed=42):
+def train_val_test_split(
+    hdf5_path: str,
+    ratios: tuple[float, float, float] = (0.80, 0.10, 0.10),
+    seed: int = 42,
+    amplitude_range_nm: Optional[Union[Tuple[float, float], List[float]]] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Randomly partition the dataset into train / val / test index arrays.
 
@@ -305,6 +423,9 @@ def train_val_test_split(hdf5_path, ratios=(0.80, 0.10, 0.10), seed=42):
     ratios : tuple of 3 floats summing to 1.0
     seed : int
         Random seed for reproducibility.
+    amplitude_range_nm : tuple/list of (min_nm, max_nm), optional
+        If set, filters examples so only those whose RMS wavefront error across
+        non-zero Zernike modes (Z4+) falls within [min_nm, max_nm] are retained.
 
     Returns
     -------
@@ -316,9 +437,26 @@ def train_val_test_split(hdf5_path, ratios=(0.80, 0.10, 0.10), seed=42):
     with h5py.File(hdf5_path, 'r') as f:
         labels = f['labels'][:]
         valid_mask = np.max(np.abs(labels), axis=-1) > 0
+
+        if amplitude_range_nm is not None:
+            min_nm = float(amplitude_range_nm[0])
+            max_nm = float(amplitude_range_nm[1])
+            if min_nm > max_nm:
+                raise ValueError(f"amplitude_range_nm min ({min_nm}) cannot exceed max ({max_nm})")
+            # Determine label units: if max abs is small (<1e-3), it is in metres OPD (~1e-7m)
+            is_metres = np.max(np.abs(labels)) < 1e-3
+            scale = 1e9 if is_metres else 1.0
+            col_start = 3 if labels.shape[1] > 3 else 0
+            wfe_nm = np.sqrt(np.sum((labels[:, col_start:] * scale) ** 2, axis=-1))
+            amp_mask = (wfe_nm >= min_nm) & (wfe_nm <= max_nm)
+            valid_mask = valid_mask & amp_mask
+
         valid_indices = np.nonzero(valid_mask)[0].astype(np.int64)
+
     N = len(valid_indices)
     if N == 0:
+        if amplitude_range_nm is not None:
+            raise ValueError(f"No valid examples found in {hdf5_path} with RMS WFE in [{min_nm}, {max_nm}] nm.")
         raise ValueError(f"No valid (non-zero) examples found in {hdf5_path}")
 
     rng = np.random.default_rng(seed)
@@ -332,6 +470,55 @@ def train_val_test_split(hdf5_path, ratios=(0.80, 0.10, 0.10), seed=42):
     test_idx  = valid_indices[perm[n_train + n_val :]]
 
     return train_idx, val_idx, test_idx
+
+
+def subsample_indices(
+    indices,
+    ratio: Optional[float] = None,
+    count: Optional[int] = None,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Subsample a fraction or count of example indices without replacement.
+
+    Parameters
+    ----------
+    indices : np.ndarray or array-like
+        Array of dataset example indices.
+    ratio : float, optional
+        Fraction of examples to retain, in the range (0.0, 1.0].
+    count : int, optional
+        Exact count of examples to retain, in the range [1, len(indices)].
+    seed : int
+        Random seed for deterministic, reproducible selection across epochs/runs.
+
+    Returns
+    -------
+    np.ndarray[int64]
+        Subsampled indices, sorted ascending to preserve sequential HDF5 chunk locality.
+        Uses permutation prefix to guarantee nested subsets across counts.
+    """
+    indices = np.asarray(indices, dtype=np.int64)
+    if count is not None:
+        if count <= 0:
+            raise ValueError(f"count must be positive, got {count}")
+        n_samples = min(len(indices), int(count))
+    elif ratio is not None:
+        ratio = float(ratio)
+        if not (0.0 < ratio <= 1.0):
+            raise ValueError(f"ratio must be in (0.0, 1.0], got {ratio}")
+        if ratio >= 1.0 or len(indices) == 0:
+            return indices
+        n_samples = max(1, int(round(len(indices) * ratio)))
+    else:
+        return indices
+
+    if n_samples >= len(indices):
+        return indices
+
+    rng = np.random.default_rng(seed)
+    chosen_pos = rng.permutation(len(indices))[:n_samples]
+    return np.sort(indices[chosen_pos])
 
 
 def get_n_modes(hdf5_path: str) -> int:

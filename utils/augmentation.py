@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from typing import Optional
 
 # ──────────────────────────────────────────────────────────────────────
 # Noll Zernike index → (radial order n, signed azimuthal frequency m)
@@ -132,6 +133,12 @@ def _zernike_block_2x2(m, flip, rot_k):
                          [ s, -c]], dtype=np.float32)
 
 
+D4_OPS = [
+    (False, 0), (False, 1), (False, 2), (False, 3),
+    (True,  0), (True,  1), (True,  2), (True,  3),
+]
+
+
 def build_d4_label_matrices(trained_modes: list[int]) -> list[torch.Tensor]:
     """
     Build the 8 D4 dihedral label-transformation matrices for an arbitrary
@@ -161,12 +168,8 @@ def build_d4_label_matrices(trained_modes: list[int]) -> list[torch.Tensor]:
     n_out = len(trained_modes)
     pairs = _find_pairs(trained_modes)
 
-    ops = [
-        (False, 0), (False, 1), (False, 2), (False, 3),
-        (True,  0), (True,  1), (True,  2), (True,  3),
-    ]
     matrices = []
-    for (flip, rot_k) in ops:
+    for (flip, rot_k) in D4_OPS:
         M = np.eye(n_out, dtype=np.float32)
         for (cos_idx, sin_idx, m) in pairs:
             block = _zernike_block_2x2(m, flip, rot_k)
@@ -264,3 +267,53 @@ def _apply_image_op(img, flip, rot_k):
     if rot_k:
         img = torch.rot90(img, k=rot_k, dims=[-2, -1])
     return img
+
+
+def apply_d4_tta(
+    model: torch.nn.Module,
+    I1: torch.Tensor,
+    I2: torch.Tensor,
+    d4_matrices: list[torch.Tensor],
+    r: Optional[torch.Tensor] = None,
+    zero_r: bool = False,
+    label_mean: Optional[torch.Tensor] = None,
+    label_std: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Run test-time augmentation (TTA) over all 8 operations of the D4 dihedral group
+    and average the inverted Zernike predictions.
+
+    For each dihedral operation k:
+      1. Transforms input frames I1, I2 (and r if provided) via `_apply_image_op(..., flip, rot_k)`.
+      2. Computes the model forward pass pred_k.
+      3. Denormalises to physical units if `label_mean` and `label_std` are provided.
+      4. Inverts the D4 label transform by post-multiplying with orthogonal matrix M_k:
+         pred_k_orig = pred_k @ M_k
+         (since y_k = M_k @ y_0 and M_k is orthogonal, y_0 = M_k^T @ y_k, which in batch
+         row form [B, D] is Y_0 = Y_k @ M_k).
+
+    Returns
+    -------
+    torch.Tensor [B, n_outputs] — ensemble mean across all 8 dihedral predictions.
+    """
+    preds_orig = []
+    device = I1.device
+
+    for op_idx, (flip, rot_k) in enumerate(D4_OPS):
+        I1_aug = _apply_image_op(I1, flip, rot_k)
+        I2_aug = _apply_image_op(I2, flip, rot_k)
+        if r is not None:
+            r_aug = torch.zeros_like(r) if zero_r else _apply_image_op(r, flip, rot_k)
+            pred_k = model(I1_aug, I2_aug, r_aug)
+        else:
+            pred_k = model(I1_aug, I2_aug)
+
+        if label_mean is not None and label_std is not None:
+            pred_k = pred_k * label_std + label_mean
+
+        M_k = d4_matrices[op_idx].to(device)
+        pred_k_orig = pred_k @ M_k
+        preds_orig.append(pred_k_orig)
+
+    return torch.stack(preds_orig, dim=0).mean(dim=0)
+
