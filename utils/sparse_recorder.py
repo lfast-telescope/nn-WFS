@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import numpy as np
 import yaml
 
+
+
 _DEFAULT_TMP_DIR = Path(__file__).resolve().parent.parent / "tmp"
 
 
@@ -124,7 +126,7 @@ class SparseRecorder:
         self._closed = False
         self._zernike_basis_cache: Optional[Dict[str, Any]] = None
 
-        # Write initial metadata header and save config.yaml
+        # Write initial metadata header
         self._write_header(config)
 
         # Set up signal handlers for graceful HPC preemption notice
@@ -204,13 +206,6 @@ class SparseRecorder:
 
         if config:
             lines.append("-" * 78)
-            try:
-                config_path = self.run_dir / "config.yaml"
-                with open(config_path, "w", encoding="utf-8") as f:
-                    yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
-                lines.append(f"Config File Saved : {config_path.resolve()}")
-            except Exception as e:
-                lines.append(f"Config Save Note  : Failed to write config.yaml ({e})")
             lines.append("Configuration Summary:")
             for k, v in config.items():
                 lines.append(f"  {k}: {v}")
@@ -365,6 +360,9 @@ class SparseRecorder:
             lines.append(row_line)
         lines.append(sep_line)
         lines.append("")
+        self._file.write("\n".join(lines) + "\n")
+        self._flush()
+
 
     def save_pupil_reconstruction(
         self,
@@ -480,19 +478,19 @@ class SparseRecorder:
             cmap = "RdBu_r"
 
             im0 = axes[0].imshow(phi_true_masked, origin="lower", cmap=cmap, vmin=v_min, vmax=v_max)
-            axes[0].set_title(f"Ground Truth Pupil\nRMS: {rms_true:.1f} nm | PV: {pv_true:.1f} nm", fontsize=11, fontweight="semibold")
+            axes[0].set_title(f"Ground Truth Pupil\nRMS: {rms_true:.1f} nm | PV: {pv_true:.1f} nm", fontsize=11, fontweight="bold")
             axes[0].axis("off")
             cbar0 = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
             cbar0.set_label("OPD (nm)", fontsize=9)
 
             im1 = axes[1].imshow(phi_pred_masked, origin="lower", cmap=cmap, vmin=v_min, vmax=v_max)
-            axes[1].set_title(f"Predicted Pupil (Model)\nRMS: {rms_pred:.1f} nm | PV: {pv_pred:.1f} nm", fontsize=11, fontweight="semibold")
+            axes[1].set_title(f"Predicted Pupil (Model)\nRMS: {rms_pred:.1f} nm | PV: {pv_pred:.1f} nm", fontsize=11, fontweight="bold")
             axes[1].axis("off")
             cbar1 = fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
             cbar1.set_label("OPD (nm)", fontsize=9)
 
             im2 = axes[2].imshow(phi_diff_masked, origin="lower", cmap=cmap, vmin=v_min, vmax=v_max)
-            axes[2].set_title(f"Residual Error (True - Pred)\nRMS: {rms_diff:.1f} nm | PV: {pv_diff:.1f} nm", fontsize=11, fontweight="semibold")
+            axes[2].set_title(f"Residual Error (True - Pred)\nRMS: {rms_diff:.1f} nm | PV: {pv_diff:.1f} nm", fontsize=11, fontweight="bold")
             axes[2].axis("off")
             cbar2 = fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
             cbar2.set_label("OPD (nm)", fontsize=9)
