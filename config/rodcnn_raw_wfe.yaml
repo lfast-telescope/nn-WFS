@@ -1,0 +1,54 @@
+model:
+  type: rodcnn
+  base_ch: 32             # stem channels; stages scale to 64→128→256→256
+  stage_blocks: 2         # BasicBlocks per ResNet stage
+  stem_stride: 2          # Stride 2 in stem: 256x256 -> 128x128 (4x FLOP reduction)
+  dropout: 0.1
+  trained_modes: null     # null defaults to Z4–Z36 (33 modes)
+  k_pairs_train: 8       # subsample K=8 pairs during training (8x FLOPs speedup); all 64 in eval
+
+data:
+  hdf5_path: data/cwfs_consolidated_chunk1.h5
+  split_ratios: [0.80, 0.10, 0.10]
+  split_seed: 42
+  batch_size: 8           # mini-batch size
+  num_workers: 4
+  preload: false          # stream chunk=1 from disk
+  augment: true
+  prefetch_factor: 4
+  z_score_labels: false  # Direct physical units (scaled to nm OPD, no per-mode normalization)
+
+training:
+  loss_type: "log_mse"  # Options: "mse", "log_mse", "wfe_rms"   
+  epochs: 100
+  lr: 6.0e-4
+  weight_decay: 1.0e-2
+  warmup_steps: 500
+  grad_clip: 1.0
+  amp: true
+  accumulate_every: 1
+  compile_mode: default
+  validate: true
+  val_sample_ratio: 0.5  # Subsample 50% for fast validation epochs
+  swa: true              # Stochastic Weight Averaging in tail epochs
+  swa_tail_epochs: 5
+
+  scheduler:
+    type: "cosine"
+    min_lr: 1.0e-6
+
+evaluation:
+  tta: true              # Test-Time Augmentation
+
+logging:
+  checkpoint_dir: checkpoints/rodcnn_raw_wfe
+  sparse_dir: logs/rodcnn_raw_wfe
+  sparse_dir: nn_WFS/tmp
+  log_interval: 1000
+  save_top_k: 2
+  sparse_record: true
+
+ensemble:
+  seeds: 2
+  mode: average
+

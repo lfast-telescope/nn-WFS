@@ -56,34 +56,48 @@ class ResNetBackbone(nn.Module):
     Lightweight ResNet-style feature extractor for single-channel PSF images.
 
     Spatial progression from a 256×256 input:
-        Stem  (stride 1) : 256×256, base_ch
-        Stage 1 (stride 2): 128×128, base_ch×2
-        Stage 2 (stride 2):  64×64, base_ch×4
-        Stage 3 (stride 2):  32×32, base_ch×8
-        Stage 4 (stride 2):  16×16, base_ch×8   ← output spatial map
+        When stem_stride=1 (default):
+            Stem  (stride 1) : 256×256, base_ch
+            Stage 1 (stride 2): 128×128, base_ch×2
+            Stage 2 (stride 2):  64×64, base_ch×4
+            Stage 3 (stride 2):  32×32, base_ch×8
+            Stage 4 (stride 2):  16×16, base_ch×8   ← output spatial map
+        When stem_stride=2:
+            Stem  (stride 2) : 128×128, base_ch
+            Stage 1 (stride 2):  64×64, base_ch×2
+            Stage 2 (stride 2):  32×32, base_ch×4
+            Stage 3 (stride 2):  16×16, base_ch×8
+            Stage 4 (stride 2):   8×8,   base_ch×8   ← output spatial map
 
     With the default base_ch=32:
-        output shape: [B, 256, 16, 16]  →  256 spatial tokens of dim 256
+        output shape (stem_stride=1): [B, 256, 16, 16]  →  256 spatial tokens of dim 256
+        output shape (stem_stride=2): [B, 256,  8,  8]  →   64 spatial tokens of dim 256
 
     Parameters
     ----------
     base_ch     : int  — stem output channels (default 32)
     stage_blocks: int  — number of BasicBlocks per stage (default 2)
+    stem_stride : int  — stride of the initial stem convolution (default 1; set to 2 for downsampled stem)
     """
 
-    def __init__(self, base_ch: int = 32, stage_blocks: int = 2):
+    def __init__(self, base_ch: int = 32, stage_blocks: int = 2, stem_stride: int = 1):
         super().__init__()
+        if stem_stride not in (1, 2):
+            raise ValueError(f"stem_stride must be 1 or 2, got {stem_stride}")
         c = base_ch
+        kernel_size = 5 if stem_stride == 2 else 3
+        padding = kernel_size // 2
         self.stem = nn.Sequential(
-            nn.Conv2d(1, c, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Conv2d(1, c, kernel_size=kernel_size, stride=stem_stride, padding=padding, bias=False),
             nn.BatchNorm2d(c),
             nn.ReLU(inplace=True),
         )
-        self.stage1 = _make_stage(c,     c * 2, stage_blocks, stride=2)   # 128
-        self.stage2 = _make_stage(c * 2, c * 4, stage_blocks, stride=2)   #  64
-        self.stage3 = _make_stage(c * 4, c * 8, stage_blocks, stride=2)   #  32
-        self.stage4 = _make_stage(c * 8, c * 8, stage_blocks, stride=2)   #  16
+        self.stage1 = _make_stage(c,     c * 2, stage_blocks, stride=2)   # 128 (or 64)
+        self.stage2 = _make_stage(c * 2, c * 4, stage_blocks, stride=2)   #  64 (or 32)
+        self.stage3 = _make_stage(c * 4, c * 8, stage_blocks, stride=2)   #  32 (or 16)
+        self.stage4 = _make_stage(c * 8, c * 8, stage_blocks, stride=2)   #  16 (or  8)
         self.out_channels = c * 8
+        self.stem_stride = stem_stride
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -140,6 +154,7 @@ class SIAMCNN(nn.Module):
     dropout        : float — dropout probability
     n_outputs      : int   — number of Zernike coefficients (default 14)
     input_mode     : str   — 'two_stream' (default) | 'r_stack' | 'pairs'
+    stem_stride    : int   — stride of the initial stem convolution (default 1)
     """
 
     def __init__(
@@ -152,6 +167,7 @@ class SIAMCNN(nn.Module):
         dropout: float = 0.0,
         n_outputs: int = 14,
         input_mode: str = 'two_stream',
+        stem_stride: int = 1,
     ):
         super().__init__()
         if input_mode not in ('two_stream', 'r_stack', 'pairs'):
@@ -161,7 +177,9 @@ class SIAMCNN(nn.Module):
         self.input_mode = input_mode
 
         # Shared Siamese backbone
-        self.backbone = ResNetBackbone(base_ch=base_ch, stage_blocks=stage_blocks)
+        self.backbone = ResNetBackbone(
+            base_ch=base_ch, stage_blocks=stage_blocks, stem_stride=stem_stride
+        )
         dim = self.backbone.out_channels
 
         if dim % n_heads != 0:
@@ -291,6 +309,7 @@ class RODCNN(nn.Module):
     stage_blocks : int   — BasicBlocks per stage (default 2)
     dropout      : float — dropout probability in regression head
     n_outputs    : int   — number of Zernike coefficients to predict (default 14)
+    stem_stride  : int   — stride of the initial stem convolution (default 1)
     """
 
     def __init__(
@@ -299,11 +318,14 @@ class RODCNN(nn.Module):
         stage_blocks: int = 2,
         dropout: float = 0.0,
         n_outputs: int = 14,
+        stem_stride: int = 1,
     ):
         super().__init__()
         self.n_outputs = n_outputs
         self.roddier   = RoddierSignal()
-        self.backbone  = ResNetBackbone(base_ch=base_ch, stage_blocks=stage_blocks)
+        self.backbone  = ResNetBackbone(
+            base_ch=base_ch, stage_blocks=stage_blocks, stem_stride=stem_stride
+        )
         dim            = self.backbone.out_channels
         self.head      = MLPHead(dim, [dim // 2], n_outputs, dropout)
 
