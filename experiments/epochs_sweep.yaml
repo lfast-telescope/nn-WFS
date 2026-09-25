@@ -1,0 +1,42 @@
+# Phase 3 — Total Epochs Experiment Sweep
+name: "epochs_sweep"
+description: "Phase 3 Total Epochs sweep evaluating [30, 50, 75, 100] epochs anchored on Phase 1 (LR=1e-3, WD=0.03) and Phase 2 (betas=[0.9, 0.999]) winners with cosine annealing, SWA, and TTA (2 seeds)"
+
+# Base configuration to inherit from
+base_config: "config/rodcnn.yaml"
+
+# Output root directory for this experiment suite
+output_root: "experiments/results/epochs_sweep"
+
+# Target WFE threshold in nanometers for evaluating convergence velocity
+target_wfe_nm: 45.0
+
+# Slurm cluster parameters (defaults for UA HPC Puma / cbender allocation)
+# Note: Memory directives (--mem / --mem-per-cpu) are omitted per UA HPC guidance.
+# The Puma standard partition defaults to DefMemPerCPU=5120M, granting 4 x 5GB = 20GB.
+slurm:
+  account: "cbender"
+  partition: "gpu_high_priority"
+  qos: "user_qos_cbender"
+  cpus_per_task: 4
+  gres: "gpu:nvidia_a100_80gb_pcie_3g.40gb"
+
+# Global overrides applied to all trials in this sweep (anchored on Phase 1 & 2 winners)
+common_overrides:
+  training.lr: 1.0e-3
+  training.weight_decay: 0.03
+  training.betas: [0.9, 0.999]
+  training.warmup_steps: 500
+  training.scheduler.type: "cosine"
+  training.scheduler.min_lr: 1.0e-6
+  training.swa: true
+  training.swa_tail_epochs: 5
+  logging.sparse_record: true
+  logging.save_top_k: 2
+  evaluation.tta: true
+  ensemble.seeds: 2
+  ensemble.mode: average
+
+# Parameter matrix: 4 trials testing convergence and diminishing returns across epoch horizons
+matrix:
+  training.epochs: [30, 50, 75, 100]

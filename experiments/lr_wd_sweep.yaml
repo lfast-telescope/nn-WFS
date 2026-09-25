@@ -1,0 +1,32 @@
+# Peak Learning Rate x AdamW Weight Decay Matrix Sweep
+name: "lr_wd_sweep"
+description: "4x4 matrix sweep of peak learning rate x AdamW weight decay with cosine annealing (30 epochs, 2 seeds)"
+
+# Base configuration to inherit from
+base_config: "config/rodcnn.yaml"
+
+# Output root directory for this experiment suite
+output_root: "experiments/results/lr_wd_sweep"
+
+# Target WFE threshold in nanometers for evaluating convergence velocity
+target_wfe_nm: 45.0
+
+# Global overrides applied to all trials in this sweep
+common_overrides:
+  training.epochs: 30
+  training.validate: true
+  training.warmup_steps: 500
+  training.scheduler.type: "cosine"
+  training.scheduler.min_lr: 1.0e-6
+  training.swa: true
+  logging.sparse_record: true
+  logging.save_top_k: 2
+  evaluation.tta: true
+  ensemble.seeds: 2
+  ensemble.mode: average
+
+# 4x4 Cartesian matrix: 16 trials exploring joint (lr, weight_decay) space
+matrix:
+  training.lr: [3.0e-4, 6.0e-4, 1.0e-3, 1.5e-3]
+  training.weight_decay: [1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2]
+

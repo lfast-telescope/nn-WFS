@@ -1,0 +1,47 @@
+# Phase 6 — Architecture Capacity Experiment Sweep
+name: "architecture_sweep"
+description: "Phase 6 Architecture Capacity sweep evaluating base_ch in [24, 32, 48] x stage_blocks in [2, 3] with dropout anchored at 0.0 on Phase 1 & 2 winners with cosine annealing, SWA, and TTA (2 seeds)"
+
+# Base configuration to inherit from
+base_config: "config/rodcnn.yaml"
+
+# Output root directory for this experiment suite
+output_root: "experiments/results/architecture_sweep"
+
+# Target WFE threshold in nanometers for evaluating convergence velocity
+target_wfe_nm: 45.0
+
+# Slurm cluster parameters (defaults for UA HPC Puma / cbender allocation)
+# Note: Memory directives (--mem / --mem-per-cpu) are omitted per UA HPC guidance.
+# The Puma standard partition defaults to DefMemPerCPU=5120M, granting 4 x 5GB = 20GB.
+slurm:
+  account: "cbender"
+  partition: "gpu_high_priority"
+  qos: "user_qos_cbender"
+  cpus_per_task: 4
+  gres: "gpu:nvidia_a100_80gb_pcie_3g.40gb"
+
+# Global overrides applied to all trials in this sweep (anchored on Phase 1 & 2 winners, dropout=0.0 at 30 epochs)
+common_overrides:
+  training.epochs: 30
+  training.lr: 1.0e-3
+  training.weight_decay: 0.03
+  training.betas: [0.9, 0.999]
+  model.dropout: 0.0
+  data.noise.enabled: false
+  training.warmup_steps: 500
+  training.scheduler.type: "cosine"
+  training.scheduler.min_lr: 1.0e-6
+  training.swa: true
+  training.swa_tail_epochs: 5
+  logging.sparse_record: true
+  logging.save_top_k: 2
+  evaluation.tta: true
+  ensemble.seeds: 2
+  ensemble.mode: average
+
+# Parameter matrix: 6 trials sweeping width (base_ch) and depth (stage_blocks)
+matrix:
+  model.base_ch: [24, 32, 48]
+  model.stage_blocks: [2, 3]
+

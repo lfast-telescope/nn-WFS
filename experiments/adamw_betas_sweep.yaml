@@ -1,0 +1,34 @@
+# AdamW Momentum (beta1) x Second-Moment Decay (beta2) Matrix Sweep
+name: "adamw_betas_sweep"
+description: "2x4 matrix sweep of AdamW beta1 x beta2 with cosine annealing anchored on Phase 1 winner (LR=1e-3, WD=0.03, 30 epochs, 2 seeds)"
+
+# Base configuration to inherit from
+base_config: "config/rodcnn.yaml"
+
+# Output root directory for this experiment suite
+output_root: "experiments/results/adamw_betas_sweep"
+
+# Target WFE threshold in nanometers for evaluating convergence velocity
+target_wfe_nm: 45.0
+
+# Global overrides applied to all trials in this sweep (anchored on Phase 1 winner: Trial 012)
+common_overrides:
+  training.epochs: 30
+  training.lr: 1.0e-3
+  training.weight_decay: 0.03
+  training.warmup_steps: 500
+  training.scheduler.type: "cosine"
+  training.scheduler.min_lr: 1.0e-6
+  training.swa: true
+  training.swa_tail_epochs: 5
+  logging.sparse_record: true
+  logging.save_top_k: 2
+  evaluation.tta: true
+  ensemble.seeds: 2
+  ensemble.mode: average
+
+# 2x4 Cartesian matrix: 8 trials exploring joint (beta1, beta2) optimizer dynamics
+matrix:
+  training.beta1: [0.85, 0.90]
+  training.beta2: [0.98, 0.99, 0.995, 0.999]
+

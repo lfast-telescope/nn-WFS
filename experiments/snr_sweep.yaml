@@ -1,0 +1,62 @@
+# SNR & Photon Noise Experiment Sweep (Orban de Xivry et al. 2021 Fig 4 & 5)
+name: "snr_sweep"
+description: "SNR and photon noise sweep evaluating on-the-fly Poisson noise across photon flux levels N_ph in [1e4, 1e5, 1e6, 1e7] vs clean baseline with cosine annealing, SWA, and TTA (2 seeds)"
+
+# Base configuration to inherit from
+base_config: "config/rodcnn.yaml"
+
+# Output root directory for this experiment suite
+output_root: "experiments/results/snr_sweep"
+
+# Target WFE threshold in nanometers for evaluating convergence velocity
+target_wfe_nm: 45.0
+
+# Slurm cluster parameters (defaults for UA HPC Puma / cbender allocation)
+slurm:
+  account: "cbender"
+  partition: "gpu_high_priority"
+  qos: "user_qos_cbender"
+  cpus_per_task: 4
+  gres: "gpu:nvidia_a100_80gb_pcie_3g.40gb"
+
+# Global overrides applied to all trials in this sweep
+common_overrides:
+  training.epochs: 30
+  training.lr: 1.0e-3
+  training.weight_decay: 0.03
+  training.betas: [0.9, 0.999]
+  model.dropout: 0.0
+  training.warmup_steps: 500
+  training.scheduler.type: "cosine"
+  training.scheduler.min_lr: 1.0e-6
+  training.swa: true
+  training.swa_tail_epochs: 5
+  logging.sparse_record: true
+  logging.save_top_k: 2
+  evaluation.tta: true
+  ensemble.seeds: 2
+  ensemble.mode: average
+
+# Explicit trials spanning clean baseline and 4 orders of magnitude in photon flux
+trials:
+  - name: "clean"
+    overrides:
+      data.noise.enabled: false
+      data.noise.photons_per_frame: null
+  - name: "nph_1e4"
+    overrides:
+      data.noise.enabled: true
+      data.noise.photons_per_frame: 1.0e4
+  - name: "nph_1e5"
+    overrides:
+      data.noise.enabled: true
+      data.noise.photons_per_frame: 1.0e5
+  - name: "nph_1e6"
+    overrides:
+      data.noise.enabled: true
+      data.noise.photons_per_frame: 1.0e6
+  - name: "nph_1e7"
+    overrides:
+      data.noise.enabled: true
+      data.noise.photons_per_frame: 1.0e7
+

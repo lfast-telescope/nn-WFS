@@ -1,0 +1,46 @@
+# Sweep Manifest Template for nn_WFS Testing Pipeline
+name: "example_parameter_sweep"
+description: "Demonstration parameter sweep template across learning rates and batch sizes"
+
+# Base configuration to inherit from (relative to this file or repository root)
+base_config: "config/rodcnn.yaml"
+
+# Output root directory for this experiment suite
+output_root: "experiments/results/example_parameter_sweep"
+
+# Target WFE threshold in nanometers for evaluating convergence velocity (epochs/time to reach target)
+target_wfe_nm: 45.0
+
+# Global overrides applied to ALL trials in this sweep
+common_overrides:
+  training.epochs: 50
+  training.validate: true
+  logging.sparse_record: true
+  logging.save_top_k: 2
+
+# Parameter sweep definition: EITHER 'matrix' (Cartesian grid) OR 'trials' (explicit list)
+matrix:
+  training.lr: [1.0e-4, 3.0e-4]
+  data.batch_size: [4, 8]
+
+# Alternatively, explicit non-orthogonal trials:
+# trials:
+#   - name: "low_lr_small_batch"
+#     overrides:
+#       training.lr: 1.0e-4
+#       data.batch_size: 4
+#   - name: "high_lr_large_batch"
+#     overrides:
+#       training.lr: 3.0e-4
+#       data.batch_size: 8
+
+# Optional Slurm cluster configuration (used when running with --mode slurm)
+# slurm:
+#   partition: "standard"
+#   account: null          # e.g. "my_pi_group"
+#   time: "02:00:00"
+#   nodes: 1
+#   ntasks: 1
+#   cpus_per_task: 4
+#   gres: "gpu:1"
+#   mem: "5G"

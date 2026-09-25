@@ -1,0 +1,63 @@
+# Learning Rate Scheduler Bake-Off Sweep Manifest
+name: "lr_scheduler_bakeoff"
+description: "5-Trial Comparison of Constant Baseline vs Cosine Annealing vs ReduceLROnPlateau at 3.0e-4 and 6.0e-4 peak learning rates"
+
+# Base configuration to inherit from
+base_config: "config/rodcnn.yaml"
+
+# Output root directory for this experiment suite
+output_root: "experiments/results/lr_scheduler_bakeoff"
+
+# Target WFE threshold in nanometers for evaluating convergence velocity
+target_wfe_nm: 45.0
+
+# Global overrides applied to all trials in this bake-off
+common_overrides:
+  training.epochs: 30
+  training.validate: true
+  training.warmup_steps: 500
+  logging.sparse_record: true
+  logging.save_top_k: 2
+  ensemble.seeds: 3
+  ensemble.mode: average
+
+# 5 explicit trials comparing candidate schedules across peak learning rates
+trials:
+  - name: "constant_lr_3e-4"
+    description: "Constant baseline learning rate at 3.0e-4 with 500-step linear warmup"
+    overrides:
+      training.lr: 3.0e-4
+      training.scheduler.type: "constant"
+
+  - name: "cosine_lr_3e-4"
+    description: "Cosine annealing from 3.0e-4 down to 1.0e-6 with 500-step linear warmup"
+    overrides:
+      training.lr: 3.0e-4
+      training.scheduler.type: "cosine"
+      training.scheduler.min_lr: 1.0e-6
+
+  - name: "cosine_lr_6e-4"
+    description: "Cosine annealing from 6.0e-4 down to 1.0e-6 with 500-step linear warmup"
+    overrides:
+      training.lr: 6.0e-4
+      training.scheduler.type: "cosine"
+      training.scheduler.min_lr: 1.0e-6
+
+  - name: "plateau_lr_3e-4"
+    description: "ReduceLROnPlateau starting at 3.0e-4 (patience=2, factor=0.5, min_lr=1.0e-6) with 500-step linear warmup"
+    overrides:
+      training.lr: 3.0e-4
+      training.scheduler.type: "plateau"
+      training.scheduler.min_lr: 1.0e-6
+      training.scheduler.patience: 2
+      training.scheduler.factor: 0.5
+
+  - name: "plateau_lr_6e-4"
+    description: "ReduceLROnPlateau starting at 6.0e-4 (patience=2, factor=0.5, min_lr=1.0e-6) with 500-step linear warmup"
+    overrides:
+      training.lr: 6.0e-4
+      training.scheduler.type: "plateau"
+      training.scheduler.min_lr: 1.0e-6
+      training.scheduler.patience: 2
+      training.scheduler.factor: 0.5
+

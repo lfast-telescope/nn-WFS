@@ -1,0 +1,43 @@
+# Learning Rate Scheduler Sweep: Cosine with Extended Plateau Tail
+name: "cosine_tail_sweep"
+description: "Optimization schedule sweep evaluating minimum learning rate floor (min_lr in [1e-6, 2e-6, 1e-5]) and extended plateau tail ratio (tail_ratio in [0.0, 0.1, 0.2]) using cosine_tail scheduler anchored at 50 epochs (2 seeds)"
+
+# Base configuration to inherit from
+base_config: "config/rodcnn.yaml"
+
+# Output root directory for this experiment suite
+output_root: "experiments/results/cosine_tail_sweep"
+
+# Target WFE threshold in nanometers for evaluating convergence velocity
+target_wfe_nm: 45.0
+
+# Slurm cluster parameters (defaults for UA HPC Puma / cbender allocation)
+slurm:
+  account: "cbender"
+  partition: "gpu_high_priority"
+  qos: "user_qos_cbender"
+  cpus_per_task: 4
+  gres: "gpu:nvidia_a100_80gb_pcie_3g.40gb"
+
+# Global overrides applied to all trials in this sweep
+common_overrides:
+  training.epochs: 50
+  training.lr: 1.0e-3
+  training.weight_decay: 0.03
+  training.betas: [0.9, 0.999]
+  model.dropout: 0.0
+  data.noise.enabled: false
+  training.warmup_steps: 500
+  training.scheduler.type: "cosine_tail"
+  training.swa: true
+  training.swa_tail_epochs: 5
+  logging.sparse_record: true
+  logging.save_top_k: 2
+  evaluation.tta: true
+  ensemble.seeds: 2
+  ensemble.mode: average
+
+# Parameter matrix: 9 trials sweeping min_lr and tail_ratio
+matrix:
+  training.scheduler.min_lr: [1.0e-6, 2.0e-6, 1.0e-5]
+  training.scheduler.tail_ratio: [0.0, 0.1, 0.2]
