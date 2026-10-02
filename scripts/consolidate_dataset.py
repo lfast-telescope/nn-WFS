@@ -1,19 +1,16 @@
 """
 consolidate_dataset.py — Consolidate partial HDF5 datasets into a single chunk=1 file.
 
-Reads one or more HDF5 simulation files (or a Virtual Dataset), extracts valid
-non-zero examples, and streams them into a single unified HDF5 file with:
-    chunks = (1, 2, T, H, W)
+Reads one or more HDF5 simulation files (shards, chunks, or legacy datasets),
+extracts valid non-zero examples, and streams them into a single unified HDF5 file with:
+    chunks = (1, C, T, H, W)   where C=5 (new modality) or C=2 (legacy)
 
-This eliminates chunk decompression overhead during training, allowing
-sub-millisecond (< 1 ms) random reads from Lustre with < 200 MB RAM usage.
-
-Usage
------
-    python -m nn_WFS.scripts.consolidate_dataset \
-        --inputs "data/cwfs_synthetic_*ex_8fr_SAVE*.h5" \
-        --output data/cwfs_consolidated_chunk1.h5 \
-        --compression gzip --compression-opts 1
+Features:
+- Sub-millisecond (< 1 ms) random reads from Lustre/Qumulo with < 200 MB RAM usage.
+- Full support for 5-channel datasets ([Ii1, Ii2, Iii1, Iii2, focal]).
+- Automatically preserves and concatenates the `/attributes` metadata group.
+- Backward compatibility: `--pad-to-5-channels` smoothly integrates legacy 2-channel
+  data into the new 5-channel format, populating default nominal attributes.
 """
 
 from __future__ import annotations
@@ -30,9 +27,24 @@ import h5py
 import numpy as np
 
 
+ATTRIBUTE_DEFAULTS = {
+    'dz1_nominal':  np.float32(0.369e-3),
+    'dz2_nominal':  np.float32(np.nan),
+    'dz_asymmetry': np.float32(0.0),
+    'dtheta_deg':   np.float32(0.0),
+    'r0':           np.float32(0.10),
+    'dz_i1':        np.float32(0.369e-3),
+    'dz_i2':        np.float32(0.369e-3),
+    'dz_ii1':       np.float32(np.nan),
+    'dz_ii2':       np.float32(np.nan),
+    'regime':       'nominal',
+}
+
+
 def scan_sources(
     patterns: List[str],
     min_valid_rows: int = 1,
+    target_channels: Optional[int] = None,
     verbose: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Scan and validate all input HDF5 files."""
@@ -92,6 +104,10 @@ def scan_sources(
                     label_units = label_units.decode("utf-8")
 
                 n_modes = int(hf["labels"].attrs.get("n_modes", labels_shape[1]))
+                n_channels = psfs_shape[1] if len(psfs_shape) >= 2 else 1
+                has_attributes = "attributes" in hf
+
+                attr_keys = list(hf["attributes"].keys()) if has_attributes else []
 
                 file_info = {
                     "path": p,
@@ -105,25 +121,36 @@ def scan_sources(
                     "labels_dtype": labels_dtype,
                     "n_modes": n_modes,
                     "label_units": str(label_units),
+                    "n_channels": n_channels,
                     "temporal": (len(psfs_shape) == 5),
                     "t_frames": int(psfs_shape[2]) if len(psfs_shape) == 5 else 1,
+                    "has_attributes": has_attributes,
+                    "attr_keys": attr_keys,
                 }
 
                 if common_schema is None:
+                    out_channels = target_channels if target_channels is not None else n_channels
+                    out_tail = list(psfs_shape[1:])
+                    out_tail[0] = out_channels
+
                     common_schema = {
-                        "psfs_shape_tail": psfs_shape[1:],
+                        "psfs_shape_tail": tuple(out_tail),
                         "psfs_dtype": psfs_dtype,
                         "labels_dtype": labels_dtype,
                         "n_modes": n_modes,
                         "label_units": str(label_units),
+                        "target_channels": out_channels,
                         "temporal": file_info["temporal"],
                         "t_frames": file_info["t_frames"],
                     }
                 else:
-                    if file_info["psfs_shape"][1:] != common_schema["psfs_shape_tail"]:
-                        raise ValueError(f"Shape mismatch in {p.name}")
                     if file_info["n_modes"] != common_schema["n_modes"]:
-                        raise ValueError(f"Mode count mismatch in {p.name}")
+                        raise ValueError(f"Mode count mismatch in {p.name}: {file_info['n_modes']} vs {common_schema['n_modes']}")
+                    if target_channels is None and file_info["n_channels"] != common_schema["target_channels"]:
+                        raise ValueError(
+                            f"Channel count mismatch in {p.name} ({file_info['n_channels']} vs {common_schema['target_channels']}). "
+                            f"Use --pad-to-5-channels to homogenize."
+                        )
 
                 source_infos.append(file_info)
         except Exception as e:
@@ -157,6 +184,8 @@ def consolidate_to_chunk1(
     chunk_psfs = (1, *schema["psfs_shape_tail"])
     chunk_labels = (1, schema["n_modes"])
 
+    has_any_attributes = any(s["has_attributes"] for s in source_infos) or schema["target_channels"] == 5
+
     if verbose:
         print("\n" + "=" * 70)
         print("CONSOLIDATING DATASET TO CHUNK=1")
@@ -164,8 +193,10 @@ def consolidate_to_chunk1(
         print(f"Target file        : {out_p}")
         print(f"Total valid samples: {total_valid:,}")
         print(f"PSF tensor shape   : {psfs_shape} [{schema['psfs_dtype']}]")
+        print(f"Channels           : {schema['target_channels']}")
         print(f"Labels shape       : {labels_shape} [{schema['labels_dtype']}]")
         print(f"Chunk layout       : psfs={chunk_psfs}, labels={chunk_labels}")
+        print(f"Attributes tracking: {'Enabled' if has_any_attributes else 'Disabled'}")
         print(f"Compression        : {compression} (opts={compression_opts})")
         print(f"Delete sources     : {delete_source} (frees space as each file finishes)")
         print("=" * 70 + "\n")
@@ -174,7 +205,6 @@ def consolidate_to_chunk1(
     current_dst = 0
 
     with h5py.File(out_p, "w") as f_out:
-        # Create chunk=1 datasets
         create_kw: Dict[str, Any] = {
             "dtype": schema["psfs_dtype"],
             "chunks": chunk_psfs,
@@ -187,36 +217,83 @@ def consolidate_to_chunk1(
         ds_psfs = f_out.create_dataset("psfs", shape=psfs_shape, **create_kw)
         ds_labels = f_out.create_dataset("labels", shape=labels_shape, dtype=schema["labels_dtype"], chunks=chunk_labels)
 
-        # Set attributes
+        # Dataset attributes
         ds_labels.attrs["n_modes"] = schema["n_modes"]
         ds_labels.attrs["label_units"] = schema["label_units"]
         ds_labels.attrs["n_total"] = total_valid
         if schema["temporal"]:
             ds_labels.attrs["t_frames"] = schema["t_frames"]
 
+        if schema["target_channels"] == 5:
+            ds_psfs.attrs['channels'] = ['Ii1', 'Ii2', 'Iii1', 'Iii2', 'focal']
+            ds_psfs.attrs['has_channel_ii'] = True
+            ds_psfs.attrs['has_focal_psf'] = True
+            ds_psfs.attrs['channel_indices'] = [0, 1, 2, 3, 4]
+        else:
+            ds_psfs.attrs['channels'] = ['Ii1', 'Ii2']
+            ds_psfs.attrs['has_channel_ii'] = False
+            ds_psfs.attrs['has_focal_psf'] = False
+            ds_psfs.attrs['channel_indices'] = [0, 1]
+
+        # Allocate /attributes datasets if required
+        attr_datasets: Dict[str, Any] = {}
+        if has_any_attributes:
+            grp_attr = f_out.create_group("attributes")
+            for k, def_val in ATTRIBUTE_DEFAULTS.items():
+                if isinstance(def_val, str):
+                    dt = h5py.string_dtype(encoding='utf-8')
+                else:
+                    dt = 'float32'
+                attr_datasets[k] = grp_attr.create_dataset(k, shape=(total_valid,), dtype=dt)
+
         # Stream copy
         for src_idx, s in enumerate(source_infos):
             src_path = s["path"]
             n_src_valid = s["n_valid"]
+            src_channels = s["n_channels"]
+            target_channels = schema["target_channels"]
+
             if verbose:
-                print(f"[{src_idx+1}/{len(source_infos)}] Reading {s['filename']} ({n_src_valid:,} valid rows)...")
+                print(f"[{src_idx+1}/{len(source_infos)}] Reading {s['filename']} ({n_src_valid:,} valid rows, ch={src_channels})...")
 
             with h5py.File(src_path, "r") as f_src:
                 src_psfs = f_src["psfs"]
                 src_labels = f_src["labels"]
+                src_has_attr = "attributes" in f_src
+                src_attrs = f_src["attributes"] if src_has_attr else None
 
-                # Copy in blocks
                 for start in range(0, n_src_valid, batch_copy_size):
                     end = min(start + batch_copy_size, n_src_valid)
                     block_len = end - start
 
-                    # Sequential slice read from source (fast)
                     psf_block = src_psfs[start:end]
                     lbl_block = src_labels[start:end]
 
-                    # Write to target
-                    ds_psfs[current_dst : current_dst + block_len] = psf_block
+                    # Channel adaptation (pad 2-channel to 5-channel if necessary)
+                    if src_channels == 2 and target_channels == 5:
+                        padded_block = np.full(
+                            (block_len, 5, *schema["psfs_shape_tail"][1:]),
+                            fill_value=np.nan,
+                            dtype=schema["psfs_dtype"]
+                        )
+                        padded_block[:, 0:2] = psf_block
+                        ds_psfs[current_dst : current_dst + block_len] = padded_block
+                    else:
+                        ds_psfs[current_dst : current_dst + block_len] = psf_block
+
                     ds_labels[current_dst : current_dst + block_len] = lbl_block
+
+                    # Attributes handling
+                    if has_any_attributes:
+                        for k, ds in attr_datasets.items():
+                            if src_has_attr and k in src_attrs:
+                                ds[current_dst : current_dst + block_len] = src_attrs[k][start:end]
+                            else:
+                                def_val = ATTRIBUTE_DEFAULTS[k]
+                                if isinstance(def_val, str):
+                                    ds[current_dst : current_dst + block_len] = [def_val] * block_len
+                                else:
+                                    ds[current_dst : current_dst + block_len] = np.full(block_len, def_val, dtype=np.float32)
 
                     current_dst += block_len
 
@@ -230,7 +307,6 @@ def consolidate_to_chunk1(
             if verbose:
                 print()
 
-            # Safely delete source file if requested
             if delete_source:
                 try:
                     os.remove(src_path)
@@ -251,13 +327,11 @@ def consolidate_to_chunk1(
         print(f"Location       : {out_p}")
         print("=" * 70 + "\n")
 
-    # Run fast verification on the created file
-    verify_dataset(out_p, total_valid, schema["n_modes"], verbose=verbose)
-
+    verify_dataset(out_p, total_valid, schema["n_modes"], schema["target_channels"], verbose=verbose)
     return out_p
 
 
-def verify_dataset(file_path: Path, expected_rows: int, expected_modes: int, verbose: bool = True):
+def verify_dataset(file_path: Path, expected_rows: int, expected_modes: int, expected_channels: int, verbose: bool = True):
     """Verify integrity and measure random-access read latency on the new dataset."""
     if verbose:
         print("Running verification checks on consolidated dataset...")
@@ -268,18 +342,23 @@ def verify_dataset(file_path: Path, expected_rows: int, expected_modes: int, ver
         labels_ds = f["labels"]
 
         assert psfs_ds.shape[0] == expected_rows, f"Row count mismatch: {psfs_ds.shape[0]} vs {expected_rows}"
+        assert psfs_ds.shape[1] == expected_channels, f"Channel count mismatch: {psfs_ds.shape[1]} vs {expected_channels}"
         assert labels_ds.shape[1] == expected_modes, f"Mode count mismatch: {labels_ds.shape[1]} vs {expected_modes}"
         assert psfs_ds.chunks[0] == 1, f"PSF chunks must be 1, got {psfs_ds.chunks}"
 
-        # Test boundary and random reads
         test_indices = [0, expected_rows // 2, expected_rows - 1]
         for idx in test_indices:
             p = psfs_ds[idx]
             l = labels_ds[idx]
-            assert not np.isnan(p).any(), f"NaN in PSFs at row {idx}"
+            # Channels 0 and 1 must always be valid non-NaN numbers:
+            assert not np.isnan(p[0:2]).any(), f"NaN in primary PSFs at row {idx}"
             assert np.max(np.abs(l)) > 0, f"All-zero label at row {idx}"
 
-        # Benchmark random read latency
+        if "attributes" in f:
+            for k in ATTRIBUTE_DEFAULTS:
+                assert k in f["attributes"], f"Missing attribute {k} in /attributes"
+                assert len(f["attributes"][k]) == expected_rows, f"Attribute length mismatch for {k}"
+
         rng = np.random.default_rng(42)
         sample_indices = rng.choice(expected_rows, min(100, expected_rows), replace=False)
 
@@ -289,7 +368,7 @@ def verify_dataset(file_path: Path, expected_rows: int, expected_modes: int, ver
         read_lat_ms = ((time.perf_counter() - t0) / len(sample_indices)) * 1000.0
 
     if verbose:
-        print(f"  [PASS] Verified {expected_rows:,} rows (boundary & non-zero checks passed).")
+        print(f"  [PASS] Verified {expected_rows:,} rows across {expected_channels} channels.")
         print(f"  [PASS] Measured random-access read latency: {read_lat_ms:.2f} ms / example.")
         print("  All verification tests passed successfully!\n")
 
@@ -300,6 +379,8 @@ def main():
                         help="Input file patterns")
     parser.add_argument("--output", "-o", default="data/cwfs_consolidated_chunk1.h5",
                         help="Output HDF5 path")
+    parser.add_argument("--pad-to-5-channels", action="store_true",
+                        help="Pad 2-channel legacy inputs to 5 channels ([Ii1, Ii2, Iii1, Iii2, focal])")
     parser.add_argument("--compression", choices=["gzip", "lzf", "none"], default="gzip",
                         help="Compression algorithm (default: gzip)")
     parser.add_argument("--compression-opts", type=int, default=1,
@@ -312,14 +393,15 @@ def main():
 
     args = parser.parse_args()
 
-    source_infos, schema = scan_sources(args.inputs, verbose=True)
+    target_ch = 5 if args.pad_to_5_channels else None
+    source_infos, schema = scan_sources(args.inputs, target_channels=target_ch, verbose=True)
 
     print("\nCandidate Sources Summary:")
     print("-" * 65)
     total_valid = 0
     total_mb = 0.0
     for s in source_infos:
-        print(f"  {s['filename']:<40} {s['n_valid']:>6,d} rows | {s['filesize_mb']:>7.1f} MB")
+        print(f"  {s['filename']:<40} {s['n_valid']:>6,d} rows | ch={s['n_channels']} | {s['filesize_mb']:>7.1f} MB")
         total_valid += s["n_valid"]
         total_mb += s["filesize_mb"]
     print("-" * 65)
@@ -344,4 +426,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

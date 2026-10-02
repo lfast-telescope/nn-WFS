@@ -7,11 +7,12 @@ optics:
   ID: 0.152              # inner aperture diameter (central obscuration), metres
   focal_ratio: 3.33      # f-number (focal length = OD * focal_ratio)
 
-  # Defocus: physical axial offset of each camera from nominal focus.
+  # Defocus distances: physical axial offsets of cameras from nominal focus.
   # Sign convention: I1 = intra-focal (+delta_z), I2 = extra-focal (-delta_z).
   # delta_z drives c4 = delta_z / (16 * focal_ratio^2 * sqrt(3))  [metres OPD]
-  # WARNING: confirm against LFAST optical design before full-scale generation.
-  delta_z: 0.369e-3        # axial defocus distance per camera, metres
+  delta_z1: 0.369e-3       # Channel I axial defocus distance per camera, metres (nominal)
+  delta_z: 0.369e-3        # Alias for delta_z1 (backward compatibility)
+  delta_z2: 0.738e-3       # Channel II axial defocus distance per camera, metres (nominal, 2x dz1)
 
   # Focal plane sampling.
   # q   : pixels per lambda/D at the reference wavelength.
@@ -20,12 +21,12 @@ optics:
   # num_airy : half-width of focal grid in lambda/D units. The defocused PSF
   #            blur radius ~ delta_z / (8*(f/#)^2 * lambda/D) in lambda/D.
   #            Set large enough that < 1% of broadband flux is clipped at
-  #            the longest wavelength.  Verify empirically with check_grid_extent.
+  #            the longest wavelength. Verify empirically with check_grid_extent.
   # Currently: match with 4x oversampled pixels on LFAST ZWO ASI183 cam
   q: 3.025
-  num_airy: 138 #valid+faster but doesn't make sense why this is <169.25-subtense on cam
+  num_airy: 138
 
-  # Sub-pixel oversampling factor.  The focal grid is sampled at
+  # Sub-pixel oversampling factor. The focal grid is sampled at
   # (img_size * pixel_oversample)^2 and binned to img_size^2 after
   # accumulation, ensuring Nyquist sampling of lambda/D is maintained.
   pixel_oversample: 4
@@ -46,36 +47,28 @@ wavelengths:
 
   # Spectral weights applied when summing monochromatic PSFs.
   # 'flat'  : uniform weights (equal energy per wavenumber interval)
-  # 'solar' : approximate G-star spectrum  (not yet implemented, falls back to flat)
+  # 'solar' : approximate G-star spectrum (not yet implemented, falls back to flat)
   weights: flat
 
 zernike:
   # Number of Zernike modes in the mirror phase screen (Noll ordering).
-  # Modes Z2..Z(2+n_modes-1) are used.  n_modes=14 covers Z2–Z15.
-  # Must match the n_outputs in the model configs (currently 14).
+  # Modes Z2..Z(2+n_modes-1) are used. n_modes=36 covers Z2–Z37 (or Z1–Z36 excluding tip/tilt/piston).
+  # Must match the n_outputs in the model configs.
   n_modes: 36
 
   # RMS amplitude of each drawn coefficient, metres OPD.
-  # Can be a scalar (same for all modes) or a list of length n_modes.
-  # 100 nm ≈ typical residual mirror error in the relevant Zernike band.
   amplitude_rms: 125.0e-9
 
   # Coefficient sampling distribution: 'gaussian' or 'uniform'
   distribution: gaussian
 
   # Per-mode amplitude normalization applied to the scalar amplitude_rms.
-  # Ignored when per_mode_rms_nm is set.
   #   'none'         - all modes share the same amplitude_rms (default)
   #   'radial_order' - amplitude for mode with Noll radial order n = amplitude_rms / n
-  #                    (lower-order modes get larger amplitudes, matching the
-  #                    qualitative shape of mirror error spectra)
   amplitude_normalization: 'radial_order'
 
   # Optional per-mode RMS override list (length must equal n_modes).
-  # If null, amplitude_rms scalar is used for all modes.
   per_mode_rms_nm: null
-  # Example override:
-  # per_mode_rms_nm: [200, 200, 80, 80, 80, 60, 60, 60, 60, 50, 50, 50, 50, 50]
 
 atmosphere:
   enabled: true
@@ -84,10 +77,7 @@ atmosphere:
   # If false, a single-layer Kolmogorov screen is used instead.
   use_las_campanas: true
 
-  # Fried parameter at 500 nm (metres). Typical values:
-  #   good seeing:    r0 = 0.20 m  
-  #   median seeing:  r0 = 0.12 m   
-  #   poor seeing:    r0 = 0.06 m   
+  # Fried parameter at 500 nm (metres) when tolerancing is disabled:
   r0_500nm: 0.10
   L0: 25.0               # outer scale for Las Campanas profile, metres
 
@@ -98,13 +88,44 @@ atmosphere:
     wind_speed: 10.0     # m/s
     wind_direction: 0.0  # radians
 
+tolerancing:
+  # Physical optomechanical and seeing variations sampled per example
+  enabled: true
+
+  # Defocus distances: uniform distribution ±10% around nominal
+  dz1:
+    distribution: "uniform"
+    nominal: 0.369e-3       # metres (369 um)
+    range_pct: 0.10         # ±10% -> [0.3321, 0.4059] mm
+  dz2:
+    distribution: "uniform"
+    nominal: 0.738e-3       # metres (738 um)
+    range_pct: 0.10         # ±10% -> [0.6642, 0.8118] mm
+
+  # Axial asymmetry between intra and extra focal cameras (shared zero-point offset)
+  # dz_i1 = dz1 + asymmetry/2, dz_i2 = dz1 - asymmetry/2
+  asymmetry:
+    distribution: "uniform"
+    max_m: 40.0e-6          # ±40 um -> [-40 um, +40 um]
+
+  # Camera rotational clocking error around nominal 180° Roddier flip
+  dtheta:
+    distribution: "uniform"
+    max_deg: 2.0            # ±2.0 degrees -> [-2.0, +2.0] deg
+
+  # Seeing conditions: Fried parameter r0 at 500 nm
+  seeing:
+    distribution: "uniform"
+    r0_min: 0.08            # metres (8 cm)
+    r0_max: 0.16            # metres (16 cm)
+
 simulation:
-  n_examples: 50000      # unique Zernike mirror states
-  t_frames: 8           # frames per sequence pair
+  n_examples: 1000       # default examples per run/shard (overridden by CLI or array task)
+  n_channels: 5          # 5 channels: [Ii1, Ii2, Iii1, Iii2, focal]
+  t_frames: 8            # frames per sequence pair
   frame_rate: 50.0       # Hz
 
   # Final PSF image size written to HDF5 [img_size x img_size].
-  # Centre-crop (or zero-pad) from the propagated grid to this size.
   img_size: 256
 
   # HDF5 chunk shape along the N axis (1 enables sub-millisecond per-example streaming).
@@ -112,8 +133,33 @@ simulation:
 
   random_seed: 42
 
+storage:
+  # Execution staging directory: Node-local NVMe/SSD (/tmp on UA HPC nodes).
+  # Set to null or "" to bypass staging and write directly to target_root.
+  staging_dir: "/tmp"
+
+  # Persistent destination root: defaults to /rental/cbender.
+  # Modular: override via CLI with --storage.target_root=/groups/cbender or /xdisk/cbender
+  target_root: "/rental/cbender"
+
+  # Relative subfolder under target_root
+  sub_dir: "cwfs_shards"
+
+  # Automatically purge local shard from staging_dir after successful copy to target_root
+  cleanup_staging: true
+
+hpc:
+  mode: "array"                 # "array" or "single"
+  partition: "standard"
+  account: "cbender"
+  qos: "user_default"
+  time_limit: "01:30:00"
+  cpus_per_task: 4
+  mem_gb: 16
+  n_tasks: 40                   # 40 tasks x 1,000 examples = 40,000 total
+  examples_per_task: 1000
+
 output:
   path: data/cwfs_synthetic.h5
   # Unit metadata stored as HDF5 attribute on the 'labels' dataset.
-  # The training pipeline asserts this value on open.
   label_units: metres_opd

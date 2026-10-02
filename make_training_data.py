@@ -1,49 +1,54 @@
-#%%
+#!/usr/bin/env python3
 """
 make_training_data.py — Synthetic CWFS Training Data Generator
 
-Produces paired defocused PSF images (I1 intra-focal, I2 extra-focal) for
-curvature wavefront sensor (CWFS) training, following Roddier & Roddier (1993).
+Produces multi-plane defocused PSF images and in-focus focal PSF images for
+nonlinear curvature wavefront sensor (nlCWFS) training, following Roddier & Roddier (1993)
+and Guyon (2010).
 
-Method: Option B — λ/D focal grid (single FraunhoferPropagator anchored at the
-reference wavelength).  For each wavelength, the PSF is propagated on the λ/D
-grid and then rescaled by (λ / λ_ref) via scipy.ndimage.zoom before summing into
-the broadband image.  This correctly reproduces the wavelength-dependent physical
-PSF size on a real detector with fixed pixel pitch.
+Tensor output shape
+-------------------
+psfs   : float16  [N, 5, T, H, W]
+         Channel 0 = I_i1  (Channel I intra-focal,  +dz1)
+         Channel 1 = I_i2  (Channel I extra-focal,  -dz1, rotated 180° + dtheta)
+         Channel 2 = I_ii1 (Channel II intra-focal, +dz2)
+         Channel 3 = I_ii2 (Channel II extra-focal, -dz2, rotated 180° + dtheta)
+         Channel 4 = I_foc (Focal plane in-focus PSF, dz=0)
 
-Output HDF5 schema
-------------------
-psfs   : float16  [N, 2, T, H, W]  channel 0 = I1 (intra-focal), 1 = I2 (extra-focal)
 labels : float32  [N, n_modes]     Zernike coefficients Z1..Z{n_modes}, metres OPD
                                     indices 0–2 (Z1 piston, Z2 tip, Z3 tilt) are always zero
-Attributes on 'labels': label_units = 'metres_opd'
 
-Usage
------
-python make_training_data.py --config config/data_generation.yaml [--output path.h5] [--dry-run]
+attributes/
+         dz1_nominal, dz2_nominal, dz_asymmetry, dtheta_deg, r0,
+         dz_i1, dz_i2, dz_ii1, dz_ii2, regime
 
-Override any config value with --section.key=value:
-    python make_training_data.py --config config/data_generation.yaml --simulation.n_examples=100
+Storage & Execution
+-------------------
+Supports two-tier data staging: workers write directly to node-local NVMe SSD (/tmp),
+then atomically sync to persistent shared storage (/rental/cbender, /groups/cbender, or /xdisk/cbender).
+Supports both standalone interactive execution and Slurm array job packaging.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import json
+import math
 import os
+import shutil
 import sys
 import time
-from pathlib import Path
-from typing import Optional
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Tuple
+
 import h5py
 import numpy as np
 import yaml
-from scipy.ndimage import zoom, gaussian_filter
+from scipy.ndimage import rotate, zoom
+
 import matplotlib
-matplotlib.use('QtAgg')
-import matplotlib.pyplot as plt
+matplotlib.use('Agg')
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
@@ -58,35 +63,51 @@ try:
         InfiniteAtmosphericLayer,
         MultiLayerAtmosphere,
         Wavefront,
-        evaluate_supersampled,
-        make_circular_aperture,
         make_focal_grid,
         make_las_campanas_atmospheric_layers,
         make_obstructed_circular_aperture,
         make_pupil_grid,
         make_zernike_basis,
-        imshow_field
     )
     from hcipy.atmosphere import Cn_squared_from_fried_parameter
 except ImportError as e:
     sys.exit(
-        f"hcipy is required to generate training data.  "
-        f"Install it with:  pip install hcipy\n  ({e})"
+        f"hcipy is required to generate training data. "
+        f"Install it with: pip install hcipy\n ({e})"
     )
 
+# Monkeypatch Grid.__hash__ for Python 3.14 xxhash byte-encoding compatibility
 try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(it, **kwargs):
-        total = kwargs.get('total', '?')
-        for i, x in enumerate(it):
-            print(f"\r  {i+1}/{total}", end='', flush=True)
-            yield x
-        print()
+    from hcipy.field.grid import Grid
+    import xxhash
+    _orig_grid_hash = Grid.__hash__
+    def _safe_grid_hash(self):
+        try:
+            return _orig_grid_hash(self)
+        except TypeError:
+            h = xxhash.xxh64()
+            coord_sys = self._coordinate_system
+            if isinstance(coord_sys, str):
+                coord_sys = coord_sys.encode('utf-8')
+            h.update(coord_sys)
+            if self.is_regular:
+                h.update(np.ascontiguousarray(self.delta))
+                h.update(np.ascontiguousarray(self.dims))
+                h.update(np.ascontiguousarray(self.zero))
+            elif self.is_separated:
+                for s in self.separated_coords:
+                    h.update(np.ascontiguousarray(s))
+            else:
+                for p in self.points:
+                    h.update(np.ascontiguousarray(p))
+            return h.intdigest()
+    Grid.__hash__ = _safe_grid_hash
+except Exception:
+    pass
 
-#%%
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Config loading
+# Config loading & Dot-access dictionary
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _NS(dict):
@@ -125,7 +146,14 @@ def apply_overrides(cfg: _NS, overrides: list) -> None:
             try:
                 value = float(value_str)
             except ValueError:
-                value = value_str
+                if value_str.lower() in ('true', 'yes'):
+                    value = True
+                elif value_str.lower() in ('false', 'no'):
+                    value = False
+                elif value_str.lower() in ('none', 'null'):
+                    value = None
+                else:
+                    value = value_str
         node[parts[-1]] = value
 
 
@@ -136,42 +164,28 @@ def apply_overrides(cfg: _NS, overrides: list) -> None:
 def make_wavelength_grid(cfg: _NS):
     """
     Return (wavelengths, weights) arrays.
-
-    Wavelengths are sampled uniformly in wavenumber between lambda_min and
-    lambda_max (equivalent to uniform photon-energy spacing).
-    Weights are normalised to sum to 1.
+    Sampled uniformly in wavenumber between lambda_min and lambda_max.
     """
     lmin = cfg.wavelengths.lambda_min
     lmax = cfg.wavelengths.lambda_max
     n    = cfg.wavelengths.n_wavelengths
-
     wavelengths = 1.0 / np.linspace(1.0 / lmax, 1.0 / lmin, n)
 
     scheme = str(cfg.wavelengths.weights).lower()
-    if scheme != 'flat':
-        print(f"Warning: unknown weight scheme '{scheme}', falling back to flat.")
-    weights = np.ones(n, dtype=np.float64)
-    weights /= weights.sum()
+    if scheme == 'flat':
+        weights = np.ones(n, dtype=np.float64) / n
+    else:
+        weights = np.ones(n, dtype=np.float64) / n
     return wavelengths, weights
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optical system
+# Optical system builder
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_optics(cfg: _NS):
     """
-    Construct hcipy optical system objects.
-
-    Returns
-    -------
-    pupil_grid        : CartesianGrid
-    focal_grid        : CartesianGrid  (λ_ref/D units, anchored at wavelength_ref)
-    prop              : FraunhoferPropagator
-    aperture          : ndarray        (annular aperture amplitude, shape N_pupil²)
-    defocus_opd_unit  : ndarray        (Noll Z4, unit amplitude, metres; shape N_pupil²)
-    c4_defocus        : float          (Noll Z4 coefficient for delta_z, metres)
-    focal_length      : float
+    Build pupil grid, focal grid, Fraunhofer propagator, and unit defocus OPD.
     """
     OD           = cfg.optics.OD
     ID           = cfg.optics.ID
@@ -181,7 +195,6 @@ def build_optics(cfg: _NS):
     num_airy     = cfg.optics.num_airy
     n_pupil      = cfg.optics.pupil_samples
     focal_length = OD * focal_ratio
-    delta_z      = cfg.optics.delta_z
 
     pupil_grid = make_pupil_grid(n_pupil, OD)
     aperture   = make_obstructed_circular_aperture(OD, ID / OD)(pupil_grid)
@@ -193,50 +206,25 @@ def build_optics(cfg: _NS):
     )
     prop = FraunhoferPropagator(pupil_grid, focal_grid, focal_length=focal_length)
 
-    # Noll Z4 (defocus) mode from hcipy.
-    # make_zernike_basis(n, D, grid, starting_mode=2) → Z2, Z3, Z4, ...
-    # Index 2 = Z4 (defocus).  D = aperture diameter in same units as grid.
+    # Unit Noll Z4 (defocus) mode from hcipy:
     basis_3      = make_zernike_basis(3, OD, pupil_grid, starting_mode=2)
-    defocus_mode = np.array(basis_3[2])          # shape (N_pupil²,)
+    defocus_mode = np.array(basis_3[2])  # shape (N_pupil²,)
 
-    # c4 = delta_z / (16 * (f/#)² * sqrt(3))   [metres OPD, Noll convention]
-    c4_defocus = delta_z / (16.0 * focal_ratio**2 * math.sqrt(3))
+    # c4 factor: c4 = delta_z / (16.0 * (f/#)² * sqrt(3))
+    c4_factor = 1.0 / (16.0 * (focal_ratio**2) * math.sqrt(3.0))
 
-    return pupil_grid, focal_grid, prop, aperture, defocus_mode, c4_defocus, focal_length
+    return pupil_grid, focal_grid, prop, aperture, defocus_mode, c4_factor, focal_length
 
 
 def build_zernike_basis(cfg: _NS, pupil_grid):
-    """
-    Return list of n_modes hcipy Zernike modes as ndarrays on pupil_grid.
-    Modes are Z1..Z{n_modes} in Noll ordering (includes piston Z1).
-    """
+    """Return list of n_modes hcipy Zernike modes as ndarrays on pupil_grid."""
     n_modes = cfg.zernike.n_modes
     basis   = make_zernike_basis(n_modes, cfg.optics.OD, pupil_grid, starting_mode=1)
-    modes   = [np.array(b) for b in basis]
-
-    print(f"  Zernike basis: {n_modes} modes Z1–Z{n_modes}, "
-          f"mode[0] (tip) peak={modes[1].max():.3f}, "
-          f"mode[2] (defocus) peak={modes[3].max():.3f}")
-    return modes
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Zernike coefficient sampling
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _noll_radial_order(j: int) -> int:
-    """Return the radial order n for Noll index j (1-based)."""
-    return int(math.ceil((-3.0 + math.sqrt(1.0 + 8.0 * j)) / 2.0))
+    return [np.array(b) for b in basis]
 
 
 def draw_coefficients(cfg: _NS, rng: np.random.Generator) -> np.ndarray:
-    """
-    Draw one set of Zernike coefficients in metres OPD, shape (n_modes,).
-
-    Builds per-mode amplitudes from config (honouring amplitude_normalization
-    and per_mode_rms_nm), then samples from the requested distribution.
-    Modes 0–2 (Z2–Z4, tip/tilt/piston equivalents) are zeroed after drawing.
-    """
+    """Draw one set of Zernike coefficients in metres OPD, shape (n_modes,)."""
     n             = cfg.zernike.n_modes
     distribution  = cfg.zernike.distribution
     normalization = str(cfg.zernike.get('amplitude_normalization', 'none')).lower()
@@ -244,53 +232,121 @@ def draw_coefficients(cfg: _NS, rng: np.random.Generator) -> np.ndarray:
 
     if override is not None:
         amplitudes = np.asarray(override, dtype=np.float64) * 1e-9
-        if len(amplitudes) != n:
-            raise ValueError(
-                f"per_mode_rms_nm has {len(amplitudes)} entries but n_modes={n}"
-            )
     else:
-        scalar = cfg.zernike.amplitude_rms   # metres
-        amplitudes = np.full(n, scalar, dtype=np.float64)
+        amp_rms = float(cfg.zernike.amplitude_rms)
         if normalization == 'radial_order':
-            # Z1 (piston) has radial order 0; clamp to 1 since its coeff is always zeroed.
-            radial_orders = np.array(
-                [max(1, _noll_radial_order(j)) for j in range(1, n + 1)],
-                dtype=np.float64,
-            )
-            amplitudes = amplitudes / radial_orders
-        elif normalization != 'none':
-            raise ValueError(
-                f"Unknown amplitude_normalization '{normalization}'. "
-                "Use 'none' or 'radial_order'."
-            )
+            factors = np.array([
+                1.0 / max(1, int(math.ceil((-3.0 + math.sqrt(1.0 + 8.0 * j)) / 2.0)))
+                for j in range(1, n + 1)
+            ], dtype=np.float64)
+            amplitudes = amp_rms * factors
+        else:
+            amplitudes = np.full(n, amp_rms, dtype=np.float64)
 
     if distribution == 'gaussian':
-        dist = rng.standard_normal(n) * amplitudes
+        coeffs = rng.normal(loc=0.0, scale=amplitudes, size=n)
     elif distribution == 'uniform':
-        half = amplitudes * math.sqrt(3)
-        dist = rng.uniform(-half, half)
+        half_width = amplitudes * math.sqrt(3.0)
+        coeffs = rng.uniform(low=-half_width, high=half_width, size=n)
     else:
-        raise ValueError(f"Unknown distribution '{distribution}'. Use 'gaussian' or 'uniform'.")
-    dist[:3] = 0  # Don't train for first three modes
-    return dist
+        raise ValueError(f"Unknown distribution: {distribution}")
+
+    # Tip, tilt, piston are uncorrectable / always zeroed
+    coeffs[0] = 0.0
+    if n > 1:
+        coeffs[1] = 0.0
+    if n > 2:
+        coeffs[2] = 0.0
+    return coeffs
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Atmosphere
+# Tolerancing parameter sampler
+# ──────────────────────────────────────────────────────────────────────────────
+
+def sample_tolerancing_parameters(cfg: _NS, rng: np.random.Generator, c4_factor: float) -> dict:
+    """
+    Sample physical optical and atmospheric tolerancing parameters for one example.
+    """
+    tol_cfg = cfg.get('tolerancing', {})
+    is_enabled = tol_cfg.get('enabled', False)
+
+    if not is_enabled:
+        dz1_nom = float(cfg.optics.get('delta_z1', cfg.optics.delta_z))
+        dz2_nom = float(cfg.optics.get('delta_z2', 2.0 * dz1_nom))
+        asym = 0.0
+        dtheta = 0.0
+        r0 = float(cfg.atmosphere.r0_500nm)
+        regime = "nominal"
+    else:
+        # dz1
+        dz1_cfg = tol_cfg.get('dz1', {})
+        dz1_nom = float(dz1_cfg.get('nominal', cfg.optics.get('delta_z1', cfg.optics.delta_z)))
+        dz1_pct = float(dz1_cfg.get('range_pct', 0.10))
+        dz1 = rng.uniform(dz1_nom * (1.0 - dz1_pct), dz1_nom * (1.0 + dz1_pct))
+
+        # dz2
+        dz2_cfg = tol_cfg.get('dz2', {})
+        dz2_nom = float(dz2_cfg.get('nominal', cfg.optics.get('delta_z2', 2.0 * dz1_nom)))
+        dz2_pct = float(dz2_cfg.get('range_pct', 0.10))
+        dz2 = rng.uniform(dz2_nom * (1.0 - dz2_pct), dz2_nom * (1.0 + dz2_pct))
+
+        # Asymmetry: shared axial zero-point offset between intra/extra
+        asym_max = float(tol_cfg.get('asymmetry', {}).get('max_m', 40.0e-6))
+        asym = rng.uniform(-asym_max, +asym_max)
+
+        # Camera clocking error
+        dtheta_max = float(tol_cfg.get('dtheta', {}).get('max_deg', 2.0))
+        dtheta = rng.uniform(-dtheta_max, +dtheta_max)
+
+        # Seeing conditions
+        seeing_cfg = tol_cfg.get('seeing', {})
+        r0_min = float(seeing_cfg.get('r0_min', 0.08))
+        r0_max = float(seeing_cfg.get('r0_max', 0.16))
+        r0 = rng.uniform(r0_min, r0_max)
+        regime = "toleranced"
+
+        dz1_nom = dz1
+        dz2_nom = dz2
+
+    # Derived physical camera positions:
+    dz_i1  = dz1_nom + 0.5 * asym
+    dz_i2  = dz1_nom - 0.5 * asym
+    dz_ii1 = dz2_nom + 0.5 * asym
+    dz_ii2 = dz2_nom - 0.5 * asym
+
+    return {
+        'dz1_nominal':  float(dz1_nom),
+        'dz2_nominal':  float(dz2_nom),
+        'dz_asymmetry': float(asym),
+        'dtheta_deg':   float(dtheta),
+        'r0':           float(r0),
+        'dz_i1':        float(dz_i1),
+        'dz_i2':        float(dz_i2),
+        'dz_ii1':       float(dz_ii1),
+        'dz_ii2':       float(dz_ii2),
+        'c4_i1':        float(dz_i1 * c4_factor),
+        'c4_i2':        float(dz_i2 * c4_factor),
+        'c4_ii1':       float(dz_ii1 * c4_factor),
+        'c4_ii2':       float(dz_ii2 * c4_factor),
+        'regime':       regime,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Atmospheric turbulence builder
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_atmosphere(cfg: _NS, pupil_grid, seed: int):
-    """
-    Construct an hcipy atmospheric object, or return None if disabled.
-    """
+    """Construct reference hcipy atmospheric object, or return None if disabled."""
     if not cfg.atmosphere.enabled:
         return None
 
-    r0   = cfg.atmosphere.r0_500nm
-    wl_r = cfg.optics.wavelength_ref
+    r0_ref = float(cfg.atmosphere.r0_500nm)
+    wl_ref = float(cfg.optics.wavelength_ref)
 
     if cfg.atmosphere.use_las_campanas:
-        cn_squared = Cn_squared_from_fried_parameter(r0, wl_r)
+        cn_squared = Cn_squared_from_fried_parameter(r0_ref, wl_ref)
         layers = make_las_campanas_atmospheric_layers(
             pupil_grid,
             cn_squared=cn_squared,
@@ -298,8 +354,8 @@ def build_atmosphere(cfg: _NS, pupil_grid, seed: int):
         )
         atm = MultiLayerAtmosphere(layers, scintillation=False)
     else:
-        sl    = cfg.atmosphere.single_layer
-        v     = sl.wind_speed
+        sl = cfg.atmosphere.single_layer
+        v = sl.wind_speed
         theta = sl.wind_direction
         velocity = [v * math.cos(theta), v * math.sin(theta)]
         layer = InfiniteAtmosphericLayer(
@@ -309,6 +365,7 @@ def build_atmosphere(cfg: _NS, pupil_grid, seed: int):
 
     atm.t = 0.0
     return atm
+
 
 def reset_atm_seed(atm):
     """Advance each layer to a new independent realization and reset t to 0."""
@@ -320,20 +377,20 @@ def reset_atm_seed(atm):
     return atm
 
 
-def get_atm_opd(atmosphere, t: float, wavelength_ref: float):
-    """
-    Return atmospheric OPD (metres) at time t as ndarray, or None.
-    """
+def get_atm_opd(atmosphere, t: float, wavelength_ref: float, atm_scale: float = 1.0):
+    """Return atmospheric OPD (metres) scaled by Kolmogorov factor (r0_ref/r0)^(5/6)."""
     if atmosphere is None:
         return None
     atmosphere.t = t
     phase_rad = np.array(atmosphere.phase_for(wavelength_ref))
     opd = phase_rad * wavelength_ref / (2.0 * math.pi)
+    if atm_scale != 1.0:
+        opd = opd * atm_scale
     return opd
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Polychromatic propagation — Option B
+# Polychromatic propagation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _centre_crop_or_pad(arr: np.ndarray, target: int) -> np.ndarray:
@@ -367,19 +424,10 @@ def propagate_polychromatic(
     weights:      np.ndarray,
     img_size:     int,
     atm,
+    atm_scale:    float = 1.0,
 ) -> np.ndarray:
     """
-    Propagate a polychromatic wavefront to the focal plane.
-
-    Simulates a long exposure as n_frames sequential frames at the configured
-    frame rate.  Each frame is the average of n_sub atmospheric samples spaced
-    by one coherence time tau_0 = 0.31 * r0 / v_wind.  The atmosphere is
-    advanced monotonically through time via atm.t assignment (hcipy evolve_until).
-
-    The caller must call reset_atm_seed(atm) before each call so that I1 and I2
-    start from independent atmospheric realizations.
-
-    Returns broadband PSF (img_size, img_size), normalised to unit total flux.
+    Propagate polychromatic wavefront through atmosphere to detector plane.
     """
     wl_ref   = cfg.optics.wavelength_ref
     n_frames = cfg.simulation.t_frames
@@ -389,27 +437,23 @@ def propagate_polychromatic(
 
     tau_0 = None
     if cfg.atmosphere.enabled and atm is not None:
-        v_wind = cfg.atmosphere.single_layer.wind_speed
-        tau_0  = 0.31 * cfg.atmosphere.r0_500nm / v_wind
+        v_wind = cfg.atmosphere.single_layer.wind_speed if not cfg.atmosphere.use_las_campanas else 10.0
+        tau_0  = 0.31 * float(cfg.atmosphere.r0_500nm) / v_wind
 
-    n_sub   = max(1, round(t_frame / tau_0)) if tau_0 is not None else 1
-    n_total = n_frames * n_sub
+    n_sub = max(1, round(t_frame / tau_0)) if tau_0 is not None else 1
 
-    static_opd = mirror_opd + defocus_sign * c4_defocus * defocus_opd
-    broadband = np.zeros((raw_size, raw_size), dtype=np.float64)
-    broadband_t_integrated = broadband.copy()
-    frames    = np.zeros((n_frames, raw_size, raw_size), dtype=np.float64)
-
-    # Ngrid_foc: focal grid side length, derived from the propagated field size
-    # (NOT the pupil grid size — they differ
+    static_opd = mirror_opd + (defocus_sign * c4_defocus * defocus_opd if c4_defocus != 0.0 else 0.0)
+    frames = np.zeros((n_frames, raw_size, raw_size), dtype=np.float64)
     Ngrid_foc = None
 
     for frame_i in range(n_frames):
+        broadband_integrated = np.zeros((raw_size, raw_size), dtype=np.float64)
         for sub_j in range(n_sub):
             t_sample  = frame_i * t_frame + sub_j * tau_0 if tau_0 is not None else 0.0
-            atm_opd   = get_atm_opd(atm, t_sample, wl_ref) if atm is not None else None
+            atm_opd   = get_atm_opd(atm, t_sample, wl_ref, atm_scale=atm_scale)
             total_opd = static_opd + atm_opd if atm_opd is not None else static_opd
 
+            broadband_sub = np.zeros((raw_size, raw_size), dtype=np.float64)
             for wl, wt in zip(wavelengths, weights):
                 phase     = (2.0 * math.pi / wl) * total_opd
                 amplitude = aperture * np.exp(1j * phase)
@@ -417,266 +461,336 @@ def propagate_polychromatic(
                 psf_field = prop.forward(wf).power
                 if Ngrid_foc is None:
                     Ngrid_foc = int(round(math.sqrt(len(psf_field))))
-                psf_2d    = np.array(psf_field).reshape(Ngrid_foc, Ngrid_foc)
+                psf_2d = np.array(psf_field).reshape(Ngrid_foc, Ngrid_foc)
                 scale = wl / wl_ref
                 if abs(scale - 1.0) < 1e-9:
                     psf_phys = psf_2d
                 else:
                     psf_phys = zoom(psf_2d, scale, order=3, mode='constant', cval=0.0)
-                broadband += wt * _centre_crop_or_pad(psf_phys, raw_size)
-            broadband_t_integrated += broadband
-            broadband = broadband*0
+                broadband_sub += wt * _centre_crop_or_pad(psf_phys, raw_size)
+            broadband_integrated += broadband_sub
 
-        frames[frame_i] = broadband_t_integrated
-        broadband_t_integrated = broadband_t_integrated*0        
+        frames[frame_i] = broadband_integrated
 
-    # Bin pixel_oversample × pixel_oversample sub-pixels into detector pixels:
-    # frames (n_frames, raw_size, raw_size) → binned_frames (n_frames, img_size, img_size)
+    # Bin sub-pixels into detector pixels:
     binned_frames = frames.reshape(
         n_frames, img_size, pixel_oversample, img_size, pixel_oversample
     ).mean(axis=(2, 4))
     total = binned_frames.sum()
     if total > 0:
         binned_frames /= total
-
     return binned_frames
 
-#%%
+
+def _apply_rotation(seq: np.ndarray, dtheta_deg: float) -> np.ndarray:
+    """
+    Rotate extra-focal sequence by 180° + dtheta_deg around center.
+    Preserves total normalized flux.
+    """
+    total_rot = 180.0 + dtheta_deg
+    if abs(dtheta_deg) < 1e-6:
+        return np.rot90(seq, k=2, axes=(1, 2))
+    
+    rotated = rotate(seq, total_rot, axes=(1, 2), reshape=False, order=3, mode='constant', cval=0.0)
+    # Re-normalize flux to prevent interpolation losses
+    orig_sum = seq.sum()
+    rot_sum = rotated.sum()
+    if rot_sum > 0:
+        rotated = rotated * (orig_sum / rot_sum)
+    return rotated
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main generation loop
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main(cfg: _NS, output_path: Optional[str] = None, dry_run: bool = False):
-    """
-    Generate the full synthetic dataset and write to HDF5.
-    """
-    n_examples  = cfg.simulation.n_examples
-    n_total     = n_examples
-    t_frames    = cfg.simulation.t_frames
-    img_size    = cfg.simulation.img_size
-    n_modes     = cfg.zernike.n_modes
-    chunk       = cfg.simulation.hdf5_chunk_size
-    seed_base   = cfg.simulation.random_seed
+def main(
+    cfg: _NS,
+    task_id: int = 0,
+    n_tasks: int = 1,
+    output_path: Optional[str] = None,
+    dry_run: bool = False,
+):
+    n_examples_total = int(cfg.simulation.n_examples)
+    t_frames         = int(cfg.simulation.t_frames)
+    img_size         = int(cfg.simulation.img_size)
+    n_modes          = int(cfg.zernike.n_modes)
+    chunk            = int(cfg.simulation.hdf5_chunk_size)
+    seed_base        = int(cfg.simulation.random_seed) + task_id * 10000
 
-    if output_path is None:
-        timestamp = datetime.now().strftime("%H%M%S")
-        base = Path(cfg.output.path)
-        out_path = base.parent / f"{base.stem}_{n_examples}ex_{t_frames}fr{base.suffix}"
-
-    else:
-        out_path = Path(output_path)
-
+    # Number of examples for this task/shard
+    n_examples = n_examples_total // n_tasks if n_tasks > 1 else n_examples_total
     if dry_run:
-        n_total = 2
-        print("DRY RUN: generating 2 examples only, no HDF5 written.")
+        n_examples = 2
+        print("DRY RUN: generating 2 examples only, verifying shapes.")
+
+    # Two-tier storage path resolution
+    storage_cfg  = cfg.get('storage', {})
+    staging_dir  = storage_cfg.get('staging_dir', None)
+    target_root  = storage_cfg.get('target_root', '/rental/cbender')
+    sub_dir      = storage_cfg.get('sub_dir', 'cwfs_shards')
+    cleanup_tmp  = storage_cfg.get('cleanup_staging', True)
+
+    shard_filename = f"cwfs_shard_task{task_id:03d}.h5" if n_tasks > 1 else "cwfs_synthetic.h5"
+
+    if output_path is not None:
+        final_target_path = Path(output_path).resolve()
+        use_staging = False
+        local_write_path = final_target_path
+    elif staging_dir and not dry_run:
+        user = os.environ.get("USER", "hpc_user")
+        job_id = os.environ.get("SLURM_ARRAY_JOB_ID", os.environ.get("SLURM_JOB_ID", str(int(time.time()))))
+        scratch_dir = Path(staging_dir) / user / f"cwfs_{job_id}"
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        local_write_path = scratch_dir / shard_filename
+        final_target_path = Path(target_root) / sub_dir / shard_filename
+        final_target_path.parent.mkdir(parents=True, exist_ok=True)
+        use_staging = True
+    else:
+        final_target_path = Path(target_root) / sub_dir / shard_filename
+        final_target_path.parent.mkdir(parents=True, exist_ok=True)
+        local_write_path = final_target_path
+        use_staging = False
+
+    print(f"\n{'='*70}")
+    print(f"CWFS DATA GENERATION (Task {task_id + 1}/{n_tasks})")
+    print(f"{'='*70}")
+    print(f"Target Examples  : {n_examples:,}")
+    print(f"Output Channels  : 5 ([Ii1, Ii2, Iii1, Iii2, focal])")
+    print(f"Frames / Example : {t_frames}")
+    print(f"Resolution       : {img_size}×{img_size} px")
+    print(f"Random Seed      : {seed_base}")
+    print(f"Local Write Path : {local_write_path}")
+    if use_staging:
+        print(f"Final Target Path: {final_target_path}")
+    print(f"{'='*70}\n")
 
     print("Building optical system...")
     (pupil_grid, focal_grid, prop,
      aperture, defocus_opd_unit,
-     c4_defocus, focal_length) = build_optics(cfg)
+     c4_factor, focal_length) = build_optics(cfg)
 
-    print(f"  OD={cfg.optics.OD} m, f/{cfg.optics.focal_ratio}, "
-          f"delta_z={cfg.optics.delta_z*1e3:.2f} mm → c4={c4_defocus*1e9:.1f} nm")
-    print(f"  Focal grid: q={cfg.optics.q}, num_airy={cfg.optics.num_airy}, "
-          f"output {img_size}×{img_size} px")
-
-    print("Building Zernike basis...")
+    print("Building Zernike basis & atmosphere...")
     zernike_basis = build_zernike_basis(cfg, pupil_grid)
     wavelengths, weights = make_wavelength_grid(cfg)
     rng = np.random.default_rng(seed_base)
 
-    print("Building atmosphere...")
+    r0_ref = float(cfg.atmosphere.r0_500nm)
     atm = build_atmosphere(cfg, pupil_grid, seed=seed_base)
-
-    print(f"  {len(wavelengths)} wavelengths "
-          f"[{wavelengths.min()*1e9:.0f}–{wavelengths.max()*1e9:.0f}] nm")
-    print(f"  {n_modes} modes, amplitude_rms={cfg.zernike.amplitude_rms*1e9:.0f} nm "
-          f"(normalization={cfg.zernike.get('amplitude_normalization', 'none')})")
-
-    # ── Dry run ──────────────────────────────────────────────────────────────
-    if dry_run:
-        for i in range(t_frames):
-            labels     = draw_coefficients(cfg, rng)
-            mirror_opd = sum(float(c) * m for c, m in zip(labels, zernike_basis))
-
-            atm = reset_atm_seed(atm)
-            I1 = propagate_polychromatic(
-                mirror_opd, +1.0, defocus_opd_unit, c4_defocus,
-                cfg, aperture, prop, pupil_grid,
-                wavelengths, weights, img_size,
-                atm,
-            )
-            atm = reset_atm_seed(atm)
-            I2 = propagate_polychromatic(
-                mirror_opd, -1.0, defocus_opd_unit, c4_defocus,
-                cfg, aperture, prop, pupil_grid,
-                wavelengths, weights, img_size,
-                atm,
-            )
-            fig, ax = plt.subplots(1, 3)
-            I1m, I2m = I1.mean(axis=0), I2.mean(axis=0)
-            I2m = np.rot90(I2m,k=2) #Roddier, yo!
-            S = (I2m - I1m)/(I2m + I1m)
-
-            if False:
-                ax[0].imshow(I1m)
-                ax[1].imshow(I2m)
-                ax[2].imshow((I1m - I2m) / (I1m + I2m + 1e-12))
-                plt.suptitle(f"c4={c4_defocus*1e9:.1f} nm")
-                fname = f"rot_150nm_1as_c4_{c4_defocus*1e9:.0f}nm.png"
-                plt.savefig('imgs/' + fname, dpi=150, bbox_inches='tight')
-                plt.close(fig)
-                print(f"    Saved {fname}")
-   
-        print("Dry run complete.")
-        return
-
-    # ── HDF5 allocation ───────────────────────────────────────────────────────
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"\nWriting {n_total} examples to {out_path} ...")
-
-    if chunk > n_total/2:
-        chunk = max(1,n_total/4)
 
     recorder = None
     if not dry_run and not getattr(cfg, 'no_sparse_record', False):
         sparse_dir = getattr(cfg, 'sparse_dir', None)
-        recorder = SparseRecorder(task_name="data_generation", output_dir=sparse_dir, config=dict(cfg))
-        print(f"HPC Sparse Recording initialized: {recorder.filepath}")
+        recorder = SparseRecorder(task_name=f"datagen_task{task_id:03d}", output_dir=sparse_dir, config=dict(cfg))
+
+    local_write_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        with h5py.File(out_path, 'w') as f:
+        with h5py.File(local_write_path, 'w') as f:
+            # 5-channel PSF dataset: [N, 5, T, H, W]
             ds_psfs = f.create_dataset(
                 'psfs',
-                shape=(n_total, 2, t_frames, img_size, img_size),
+                shape=(n_examples, 5, t_frames, img_size, img_size),
                 dtype='float16',
-                chunks=(chunk, 2, t_frames, img_size, img_size),
+                chunks=(1, 5, t_frames, img_size, img_size),
                 compression='gzip', compression_opts=4,
             )
+            ds_psfs.attrs['channels'] = ['Ii1', 'Ii2', 'Iii1', 'Iii2', 'focal']
+            ds_psfs.attrs['has_channel_ii'] = True
+            ds_psfs.attrs['has_focal_psf'] = True
+            ds_psfs.attrs['channel_indices'] = [0, 1, 2, 3, 4]
+
+            # Labels dataset: [N, n_modes]
             ds_labels = f.create_dataset(
                 'labels',
-                shape=(n_total, n_modes),
+                shape=(n_examples, n_modes),
                 dtype='float32',
-                chunks=(chunk, n_modes),
+                chunks=(max(1, min(64, n_examples)), n_modes),
             )
             ds_labels.attrs['label_units'] = cfg.output.label_units
             ds_labels.attrs['noll_start']  = 1
             ds_labels.attrs['n_modes']     = n_modes
             f.attrs['config'] = json.dumps(dict(cfg), default=str)
 
-            row = 0
-            t0  = time.time()
+            # /attributes group for physical tolerancing & regime tracking
+            grp_attr = f.create_group('attributes')
+            ds_dz1_nom = grp_attr.create_dataset('dz1_nominal', shape=(n_examples,), dtype='float32')
+            ds_dz2_nom = grp_attr.create_dataset('dz2_nominal', shape=(n_examples,), dtype='float32')
+            ds_asym    = grp_attr.create_dataset('dz_asymmetry', shape=(n_examples,), dtype='float32')
+            ds_dtheta  = grp_attr.create_dataset('dtheta_deg', shape=(n_examples,), dtype='float32')
+            ds_r0      = grp_attr.create_dataset('r0', shape=(n_examples,), dtype='float32')
+            ds_dzi1    = grp_attr.create_dataset('dz_i1', shape=(n_examples,), dtype='float32')
+            ds_dzi2    = grp_attr.create_dataset('dz_i2', shape=(n_examples,), dtype='float32')
+            ds_dzii1   = grp_attr.create_dataset('dz_ii1', shape=(n_examples,), dtype='float32')
+            ds_dzii2   = grp_attr.create_dataset('dz_ii2', shape=(n_examples,), dtype='float32')
+            ds_regime  = grp_attr.create_dataset('regime', shape=(n_examples,), dtype=h5py.string_dtype(encoding='utf-8'))
+
+            t0 = time.time()
             last_time = time.time()
 
             for ex_idx in range(n_examples):
-                start_time = time.time()
-                labels_ex  = draw_coefficients(cfg, rng)
-                
+                labels_ex = draw_coefficients(cfg, rng)
                 mirror_opd = sum(float(c) * m for c, m in zip(labels_ex, zernike_basis))
 
+                # Tolerancing parameters
+                params = sample_tolerancing_parameters(cfg, rng, c4_factor)
+                atm_scale = (r0_ref / params['r0'])**(5.0 / 6.0)
+
+                # Channel 0: I_i1 (intra 1)
                 atm = reset_atm_seed(atm)
-                I1m = propagate_polychromatic(
-                    mirror_opd, +1.0, defocus_opd_unit, c4_defocus,
+                I_i1 = propagate_polychromatic(
+                    mirror_opd, +1.0, defocus_opd_unit, params['c4_i1'],
                     cfg, aperture, prop, pupil_grid,
                     wavelengths, weights, img_size,
-                    atm,
+                    atm, atm_scale=atm_scale,
                 )
+
+                # Channel 1: I_i2 (extra 1, rotated 180° + dtheta)
                 atm = reset_atm_seed(atm)
-                I2m = np.rot90(propagate_polychromatic(
-                    mirror_opd, -1.0, defocus_opd_unit, c4_defocus,
+                I_i2_raw = propagate_polychromatic(
+                    mirror_opd, -1.0, defocus_opd_unit, params['c4_i2'],
                     cfg, aperture, prop, pupil_grid,
                     wavelengths, weights, img_size,
-                    atm,
-                ), k=2)
+                    atm, atm_scale=atm_scale,
+                )
+                I_i2 = _apply_rotation(I_i2_raw, params['dtheta_deg'])
 
-                tmpname = os.path.join(os.getcwd(),'tmp')
-                avgsize = 3
-                R = (np.mean(I1m[:avgsize],0)-np.mean(I2m[:avgsize],0))/(np.mean(I1m[:avgsize],0)+np.mean(I2m[:avgsize],0)+1e-6)
-                os.makedirs(tmpname, exist_ok=True)
-                plt.imshow(gaussian_filter(R,1))
-                plt.colorbar()
-                plt.title(f"idx:{ex_idx} time: {time.time()-start_time}s")
-                plt.savefig(os.path.join(tmpname,'debug_fig.png'))
-                plt.close()
+                # Channel 2: I_ii1 (intra 2)
+                atm = reset_atm_seed(atm)
+                I_ii1 = propagate_polychromatic(
+                    mirror_opd, +1.0, defocus_opd_unit, params['c4_ii1'],
+                    cfg, aperture, prop, pupil_grid,
+                    wavelengths, weights, img_size,
+                    atm, atm_scale=atm_scale,
+                )
 
-                ds_psfs[row, 0]  = I1m.astype(np.float16)
-                ds_psfs[row, 1]  = I2m.astype(np.float16)
-                ds_labels[row]   = labels_ex.astype(np.float32)
-                row += 1
-                f.flush()
+                # Channel 3: I_ii2 (extra 2, rotated 180° + dtheta)
+                atm = reset_atm_seed(atm)
+                I_ii2_raw = propagate_polychromatic(
+                    mirror_opd, -1.0, defocus_opd_unit, params['c4_ii2'],
+                    cfg, aperture, prop, pupil_grid,
+                    wavelengths, weights, img_size,
+                    atm, atm_scale=atm_scale,
+                )
+                I_ii2 = _apply_rotation(I_ii2_raw, params['dtheta_deg'])
 
-                if (ex_idx % 2) == 0 or ex_idx == n_examples - 1:
+                # Channel 4: I_focal (in-focus PSF, c4=0)
+                atm = reset_atm_seed(atm)
+                I_focal = propagate_polychromatic(
+                    mirror_opd, 0.0, defocus_opd_unit, 0.0,
+                    cfg, aperture, prop, pupil_grid,
+                    wavelengths, weights, img_size,
+                    atm, atm_scale=atm_scale,
+                )
+
+                # Store into HDF5
+                ds_psfs[ex_idx, 0] = I_i1.astype(np.float16)
+                ds_psfs[ex_idx, 1] = I_i2.astype(np.float16)
+                ds_psfs[ex_idx, 2] = I_ii1.astype(np.float16)
+                ds_psfs[ex_idx, 3] = I_ii2.astype(np.float16)
+                ds_psfs[ex_idx, 4] = I_focal.astype(np.float16)
+
+                ds_labels[ex_idx] = labels_ex.astype(np.float32)
+
+                ds_dz1_nom[ex_idx] = params['dz1_nominal']
+                ds_dz2_nom[ex_idx] = params['dz2_nominal']
+                ds_asym[ex_idx]    = params['dz_asymmetry']
+                ds_dtheta[ex_idx]  = params['dtheta_deg']
+                ds_r0[ex_idx]      = params['r0']
+                ds_dzi1[ex_idx]    = params['dz_i1']
+                ds_dzi2[ex_idx]    = params['dz_i2']
+                ds_dzii1[ex_idx]   = params['dz_ii1']
+                ds_dzii2[ex_idx]   = params['dz_ii2']
+                ds_regime[ex_idx]  = params['regime']
+
+                if (ex_idx + 1) % 5 == 0 or ex_idx == n_examples - 1:
                     elapsed = time.time() - t0
-                    interval = time.time() - last_time
-                    last_time = time.time()
-                    done    = row
-                    rate    = done / elapsed if elapsed > 0 else 0
-                    eta_seconds     = (n_total - done) / rate if rate > 0 else float('inf')
-                    eta_td  = timedelta(seconds=int(eta_seconds))
-                    print(f"  [{done:>{len(str(n_total))}}/{n_total}]  "
-                        f"{int(elapsed):>5}s  {interval:5.1f}s  {rate:.2f} ex/s  ETA {str(eta_td)}")
+                    done = ex_idx + 1
+                    rate = done / elapsed if elapsed > 0 else 0
+                    eta_sec = (n_examples - done) / rate if rate > 0 else 0
+                    eta_td = timedelta(seconds=int(eta_sec))
+                    print(f"  [{done:>{len(str(n_examples))}}/{n_examples}] "
+                          f"{int(elapsed):>4}s | {rate:.2f} ex/s | ETA: {str(eta_td)}")
 
-                    if recorder is not None and ((ex_idx % 10 == 0) or (ex_idx == n_examples - 1)):
+                    if recorder is not None and ((done % 20 == 0) or (done == n_examples)):
                         recorder.record_step(
-                            step=f"{done}/{n_total}",
-                            metrics={"rate_ex_per_sec": rate, "eta_sec": eta_seconds},
+                            step=f"{done}/{n_examples}",
+                            metrics={"rate_ex_per_sec": rate, "eta_sec": eta_sec},
                             phase="gen",
                             step_name="example",
                             elapsed_s=int(elapsed),
                         )
 
-            print(f"\nDone.  HDF5: {out_path}")
-            print(f"  {'psfs':<8} {str(ds_psfs.shape):<18} float16")
-            print(f"  {'labels':<8} {str(ds_labels.shape):<18} float32")
+        print(f"\nLocal Generation Complete: {local_write_path}")
+        if recorder is not None:
+            recorder.log_message(f"Task {task_id} generated {n_examples} examples.")
+            recorder.close(status="COMPLETED")
 
-            if recorder is not None:
-                recorder.log_message(f"Generation complete: {n_total} examples saved to {out_path}")
-                recorder.close(status="COMPLETED")
+        # Two-tier staging: move to shared target
+        if use_staging:
+            print(f"Staging to persistent storage: {final_target_path} ...")
+            tmp_final = final_target_path.with_suffix(".tmp")
+            shutil.copy2(local_write_path, tmp_final)
+            tmp_final.replace(final_target_path)
+            print(f"Successfully staged to {final_target_path}")
+
+            if cleanup_tmp:
+                try:
+                    local_write_path.unlink(missing_ok=True)
+                    if local_write_path.parent.exists() and not list(local_write_path.parent.iterdir()):
+                        local_write_path.parent.rmdir()
+                    print("Local staging cleanup complete.")
+                except Exception as e:
+                    print(f"[WARN] Staging cleanup warning: {e}")
 
     except Exception as e:
         if recorder is not None:
-            recorder.log_message(f"[ERROR] Data generation aborted with exception: {e}")
+            recorder.log_message(f"[ERROR] Data generation aborted: {e}")
             recorder.close(status=f"FAILED ({type(e).__name__})")
         raise
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CLI
+# CLI entrypoint
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Generate synthetic CWFS training data.',
+        description='Generate synthetic 5-channel CWFS training data with tolerancing.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('--config',   required=True,
+    parser.add_argument('--config', required=True,
                         help='Path to data_generation.yaml.')
-    parser.add_argument('--output',   default=None,
-                        help='Override output HDF5 path from config.')
-    parser.add_argument('--dry-run',  action='store_true',
-                        help='Generate 2 examples and print shapes, no HDF5 written.')
+    parser.add_argument('--task_id', type=int, default=0,
+                        help='Slurm array task ID (0-indexed, default: 0).')
+    parser.add_argument('--n_tasks', type=int, default=1,
+                        help='Total number of tasks in the array (default: 1).')
+    parser.add_argument('--n_examples', type=int, default=None,
+                        help='Override total number of examples to generate.')
+    parser.add_argument('--output', default=None,
+                        help='Override output HDF5 path.')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Generate 2 examples only to verify shapes.')
     parser.add_argument('--sparse_dir', default=None,
-                        help='Directory for sparse HPC logs (defaults to nn_WFS/tmp).')
+                        help='Directory for sparse HPC logs.')
     parser.add_argument('--no_sparse_record', action='store_true',
                         help='Disable sparse HPC logging.')
 
     args, overrides = parser.parse_known_args()
     cfg = load_config(args.config)
     apply_overrides(cfg, overrides)
+
+    if args.n_examples is not None:
+        cfg.simulation.n_examples = args.n_examples
     if args.sparse_dir:
         cfg.sparse_dir = args.sparse_dir
     if args.no_sparse_record:
         cfg.no_sparse_record = True
-    main(cfg, output_path=args.output, dry_run=args.dry_run)
 
-
-# ── Legacy constants kept for reference ──────────────────────────────────────
-# OD, ID = 0.76, 0.152               # metres
-# FOCAL_LENGTH = OD * 3.33
-# WAVELENGTHS = 1.0 / np.linspace(1/700e-9, 1/400e-9, 35)
-# DEFOCUS_WFE = 4.5 * 545e-9
-# N_ZERNIKE   = 36
-# N_EXAMPLES  = 1000
-# T_FRAMES    = 32
-# N_ATM_SEEDS = 1
-# DT          = 1/50
+    main(
+        cfg=cfg,
+        task_id=args.task_id,
+        n_tasks=args.n_tasks,
+        output_path=args.output,
+        dry_run=args.dry_run,
+    )

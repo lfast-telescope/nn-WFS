@@ -80,7 +80,13 @@ class ResNetBackbone(nn.Module):
     stem_stride : int  — stride of the initial stem convolution (default 1; set to 2 for downsampled stem)
     """
 
-    def __init__(self, base_ch: int = 32, stage_blocks: int = 2, stem_stride: int = 1):
+    def __init__(
+        self,
+        base_ch: int = 32,
+        stage_blocks: int = 2,
+        stem_stride: int = 1,
+        in_channels: int = 1,
+    ):
         super().__init__()
         if stem_stride not in (1, 2):
             raise ValueError(f"stem_stride must be 1 or 2, got {stem_stride}")
@@ -88,7 +94,7 @@ class ResNetBackbone(nn.Module):
         kernel_size = 5 if stem_stride == 2 else 3
         padding = kernel_size // 2
         self.stem = nn.Sequential(
-            nn.Conv2d(1, c, kernel_size=kernel_size, stride=stem_stride, padding=padding, bias=False),
+            nn.Conv2d(in_channels, c, kernel_size=kernel_size, stride=stem_stride, padding=padding, bias=False),
             nn.BatchNorm2d(c),
             nn.ReLU(inplace=True),
         )
@@ -322,12 +328,16 @@ class RODCNN(nn.Module):
     ):
         super().__init__()
         self.n_outputs = n_outputs
+
         self.roddier   = RoddierSignal()
         self.backbone  = ResNetBackbone(
-            base_ch=base_ch, stage_blocks=stage_blocks, stem_stride=stem_stride
+            base_ch=base_ch,
+            stage_blocks=stage_blocks,
+            stem_stride=stem_stride,
+            in_channels=1,
         )
-        dim            = self.backbone.out_channels
-        self.head      = MLPHead(dim, [dim // 2], n_outputs, dropout)
+        backbone_dim   = self.backbone.out_channels
+        self.head      = MLPHead(backbone_dim, [backbone_dim // 2], n_outputs, dropout)
 
     def forward(
         self,
