@@ -42,7 +42,7 @@ _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
-from dataset import CWFSDataset, train_val_test_split, get_n_modes
+from dataset import CWFSDataset, train_val_test_split, get_n_modes, EPS_RODDIER, apply_detector_noise
 from train import build_model, NOLL_MODE_NAMES
 from models.cnn_cwfs import RODCNN
 from utils.metrics import per_mode_rms, total_wfe_rms, strehl_proxy, format_order_grouped_rms
@@ -147,6 +147,7 @@ def _predict(
     recorder: Optional[SparseRecorder] = None,
     tta: bool = False,
     trained_modes: Optional[list[int]] = None,
+    noise_cfg: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Run model inference over a DataLoader and return denormalised predictions
@@ -168,11 +169,24 @@ def _predict(
         If True, apply Test-Time Augmentation (TTA) using the D4 dihedral group (8 operations).
     trained_modes : list of int, optional
         Ascending Noll indices corresponding to the model outputs. Required for TTA inversion.
+    noise_cfg : dict, optional
+        Detector noise configuration dict. If None, checks loader.dataset.noise_cfg.
     """
     all_pred, all_target = [], []
     lm = label_mean.to(device)
     ls = label_std.to(device)
     total_batches = len(loader)
+
+    ds = getattr(loader, 'dataset', None)
+    underlying_ds = getattr(ds, 'dataset', ds)
+    if noise_cfg is None and underlying_ds is not None:
+        noise_cfg = getattr(underlying_ds, 'noise_cfg', None)
+    T = getattr(underlying_ds, 'T', 1) if underlying_ds is not None else 1
+
+    raw_model = getattr(model, '_orig_mod', model)
+    is_rodcnn = isinstance(raw_model, RODCNN)
+    input_mode = getattr(raw_model, 'input_mode', 'two_stream' if is_rodcnn else 'pairs')
+    model_takes_r = (not is_rodcnn and input_mode == 'pairs')
 
     d4_matrices = None
     if tta:
@@ -190,23 +204,56 @@ def _predict(
             I1     = batch['I1'].to(device, non_blocking=True)
             I2     = batch['I2'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
+            sample_id = batch.get('sample_id')
+            if sample_id is not None and isinstance(sample_id, torch.Tensor):
+                sample_id = sample_id.to(device, non_blocking=True)
+
+            if noise_cfg is not None and noise_cfg.get('enabled', False):
+                I1 = apply_detector_noise(I1, T=T, noise_cfg=noise_cfg, is_train=False, sample_id=sample_id, stream_id=0)
+                I2 = apply_detector_noise(I2, T=T, noise_cfg=noise_cfg, is_train=False, sample_id=sample_id, stream_id=1)
 
             if tta and d4_matrices is not None:
-                r_batch = batch.get('r')
-                if r_batch is not None:
-                    r_batch = r_batch.to(device, non_blocking=True)
+                if model_takes_r:
+                    if noise_cfg is not None and noise_cfg.get('enabled', False):
+                        r_batch = (I1 - I2) / (I1 + I2 + EPS_RODDIER)
+                    else:
+                        r_batch = batch.get('r')
+                        if r_batch is not None:
+                            r_batch = r_batch.to(device, non_blocking=True)
+                else:
+                    r_batch = None
                 pred_phys = apply_d4_tta(
                     model, I1, I2, d4_matrices,
                     r=r_batch, zero_r=zero_r,
                     label_mean=lm, label_std=ls,
                 )
                 labels_eff = labels
-            elif isinstance(model, RODCNN):
+            elif is_rodcnn:
                 pred       = model(I1, I2)                       # [B, n_outputs]
                 labels_eff = labels
                 pred_phys   = pred * ls + lm
-            else:
-                r = batch['r'].to(device, non_blocking=True)
+            elif input_mode == 'two_stream':
+                pred       = model(I1, I2)                       # [B, n_outputs]
+                labels_eff = labels
+                pred_phys   = pred * ls + lm
+            elif input_mode == 'r_stack':
+                if noise_cfg is not None and noise_cfg.get('enabled', False):
+                    T_cnt = I1.shape[1]
+                    I1_exp = I1.unsqueeze(2)
+                    I2_exp = I2.unsqueeze(1)
+                    R = (I1_exp - I2_exp) / (I1_exp + I2_exp + EPS_RODDIER)
+                    R = R.reshape(I1.shape[0], T_cnt * T_cnt, *R.shape[3:])
+                else:
+                    R = batch['R'].to(device, non_blocking=True)
+                pred       = model(R)                            # [B*T², n_outputs]
+                TT = pred.shape[0] // labels.shape[0]
+                labels_eff = labels.repeat_interleave(TT, dim=0) # [B*T², n_modes]
+                pred_phys   = pred * ls + lm
+            else:  # 'pairs' (default)
+                if noise_cfg is not None and noise_cfg.get('enabled', False):
+                    r = (I1 - I2) / (I1 + I2 + EPS_RODDIER)
+                else:
+                    r = batch['r'].to(device, non_blocking=True)
                 if zero_r:
                     r = torch.zeros_like(r)
                 pred       = model(I1, I2, r)                    # [B, n_outputs]
@@ -303,6 +350,7 @@ def eval_synthetic(
     recorder: Optional[SparseRecorder] = None,
     tta: bool = False,
     trained_modes: Optional[list[int]] = None,
+    noise_cfg: Optional[dict] = None,
 ) -> dict:
     """
     Evaluate model on the synthetic test set.
@@ -319,6 +367,7 @@ def eval_synthetic(
     recorder    : SparseRecorder, optional — HPC sparse recorder
     tta         : bool, optional — if True, apply D4 dihedral test-time augmentation
     trained_modes : list[int], optional — trained Noll indices for TTA inversion
+    noise_cfg   : dict, optional — detector noise configuration dict
 
     Returns
     -------
@@ -330,7 +379,8 @@ def eval_synthetic(
     ls = torch.from_numpy(label_std)
     pred, target = _predict(
         model, test_loader, lm, ls, device,
-        recorder=recorder, tta=tta, trained_modes=trained_modes
+        recorder=recorder, tta=tta, trained_modes=trained_modes,
+        noise_cfg=noise_cfg,
     )
     metrics = _metrics_table(pred, target)
     _print_table(metrics, header="Synthetic test-set evaluation", mode_names=mode_names)
@@ -363,6 +413,7 @@ def eval_ensemble(
     recorder: Optional[SparseRecorder] = None,
     tta: bool = False,
     use_raw: bool = False,
+    noise_cfg: Optional[dict] = None,
 ) -> dict:
     """
     Evaluate an ensemble of model checkpoints on the test set.
@@ -378,6 +429,7 @@ def eval_ensemble(
     recorder    : SparseRecorder, optional — HPC sparse recorder
     tta         : bool, optional — if True, apply D4 dihedral test-time augmentation
     use_raw     : bool, optional — if True, load raw instantaneous weights bypassing SWA
+    noise_cfg   : dict, optional — detector noise configuration dict
 
     Returns
     -------
@@ -409,6 +461,7 @@ def eval_ensemble(
             best_model, test_loader, lm, ls, device,
             labels_are_zscored=labels_are_zscored, recorder=recorder,
             tta=tta, trained_modes=tm,
+            noise_cfg=noise_cfg,
         )
         metrics = _metrics_table(pred, target)
         _print_table(metrics, header=f"Ensemble Test Set Evaluation: Best Model ({Path(best_ckpt).name})",
@@ -432,6 +485,7 @@ def eval_ensemble(
                 m, test_loader, lm, ls, device,
                 labels_are_zscored=labels_are_zscored,
                 tta=tta, trained_modes=tm,
+                noise_cfg=noise_cfg,
             )
 
             all_preds.append(pred)
@@ -781,6 +835,7 @@ def make_test_loader(
     num_workers: int = 4,
     mode_columns: Optional[list] = None,
     return_stacks: bool = False,
+    noise_cfg: Optional[dict] = None,
 ) -> DataLoader:
     """
     Convenience function: build a DataLoader for the held-out test split.
@@ -795,6 +850,8 @@ def make_test_loader(
         0-based label column indices to select.
     return_stacks : bool
         If True, return temporal frame stacks per example (needed for RODCNN).
+    noise_cfg     : dict or None, optional
+        Detector noise configuration dict.
     """
     _, _, test_idx = train_val_test_split(hdf5_path, split_ratios, split_seed)
     ds = CWFSDataset(
@@ -802,6 +859,8 @@ def make_test_loader(
         label_stats=label_stats,
         mode_columns=mode_columns,
         return_stacks=return_stacks,
+        noise_cfg=noise_cfg,
+        is_train=False,
     )
     return DataLoader(
         ds, batch_size=batch_size, shuffle=False,
@@ -836,6 +895,11 @@ def _parse_args():
     p.add_argument('--tta', dest='tta',   action='store_true', default=False, help="Enable D4 test-time augmentation (8x dihedral ensemble)")
     p.add_argument('--no_tta', dest='tta', action='store_false', help="Disable D4 test-time augmentation")
     p.add_argument('--raw_weights',       action='store_true', default=False, help="Load raw instantaneous training weights instead of SWA averaged weights")
+    p.add_argument('--noise_enabled',     dest='noise_enabled', action='store_true', default=None, help="Enable on-the-fly detector noise injection during evaluation")
+    p.add_argument('--no_noise',          dest='noise_enabled', action='store_false', help="Disable detector noise injection")
+    p.add_argument('--photons_per_frame', type=float, default=None, help="Incident photons per frame (e.g. 1e5)")
+    p.add_argument('--photons_per_image', type=float, default=None, help="Alias for --photons_per_frame")
+    p.add_argument('--read_noise_e',      type=float, default=None, help="Gaussian readout noise std in RMS electrons (e.g. 2.0)")
     return p.parse_args()
 
 
@@ -843,6 +907,21 @@ if __name__ == '__main__':
     args = _parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
+
+    noise_cfg = None
+    if getattr(args, 'noise_enabled', None) is not None or getattr(args, 'photons_per_frame', None) is not None or getattr(args, 'photons_per_image', None) is not None or getattr(args, 'read_noise_e', None) is not None:
+        n_ph = args.photons_per_frame if args.photons_per_frame is not None else (args.photons_per_image if args.photons_per_image is not None else 1e6)
+        noise_cfg = {
+            'enabled': bool(args.noise_enabled) if args.noise_enabled is not None else True,
+            'photons_per_frame': float(n_ph),
+            'photons_per_image': float(n_ph),
+            'read_noise_e': float(args.read_noise_e) if args.read_noise_e is not None else 0.0,
+            'seed': 42,
+        }
+        if noise_cfg['enabled']:
+            print(f"Evaluation Noise Injection: ENABLED (N_ph: {noise_cfg['photons_per_frame']:.1e} photons/frame, read_noise: {noise_cfg['read_noise_e']:.1f} e-)")
+        else:
+            print("Evaluation Noise Injection: DISABLED (clean data)")
 
     recorder = None
     if not args.no_sparse_record:
@@ -902,12 +981,14 @@ if __name__ == '__main__':
                                            batch_size=args.batch_size,
                                            num_workers=args.num_workers,
                                            mode_columns=mode_cols,
-                                           return_stacks=is_rodcnn)
+                                           return_stacks=is_rodcnn,
+                                           noise_cfg=noise_cfg)
             mode_names = mode_names_from_config(first_mc)
             eval_ensemble(
                 ckpt_paths, test_loader, device, mode=args.ensemble_mode,
                 mode_names=mode_names, labels_are_zscored=False, recorder=recorder,
                 tta=args.tta, use_raw=args.raw_weights,
+                noise_cfg=noise_cfg,
             )
             if recorder is not None:
                 recorder.close(status="COMPLETED")
@@ -930,7 +1011,8 @@ if __name__ == '__main__':
             # raw-label loader so each model uses its own normalisation stats
             test_loader = make_test_loader(args.hdf5_path, label_stats=None,
                                            batch_size=args.batch_size,
-                                           num_workers=args.num_workers)
+                                           num_workers=args.num_workers,
+                                           noise_cfg=noise_cfg)
             compare_models(
                 args.ckpt_transformer, args.ckpt_cnn, test_loader, device,
                 recorder=recorder, tta=args.tta, use_raw=args.raw_weights,
@@ -964,13 +1046,15 @@ if __name__ == '__main__':
                                            batch_size=args.batch_size,
                                            num_workers=args.num_workers,
                                            mode_columns=mode_columns,
-                                           return_stacks=is_rodcnn)
+                                           return_stacks=is_rodcnn,
+                                           noise_cfg=noise_cfg)
             lm_eval = lm[mode_columns] if mode_columns is not None else lm
             ls_eval = ls[mode_columns] if mode_columns is not None else ls
             eval_synthetic(
                 model, test_loader, lm_eval, ls_eval, device,
                 mode_names=mode_names, recorder=recorder,
                 tta=args.tta, trained_modes=trained_modes_ckpt,
+                noise_cfg=noise_cfg,
             )
 
             if args.ablate_roddier:

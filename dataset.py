@@ -11,22 +11,23 @@ EPS_RODDIER = 1e-6
 
 def apply_detector_noise(
     I: torch.Tensor,
-    T: int,
-    noise_cfg: Optional[dict],
-    is_train: bool,
-    sample_id: int,
+    T: Optional[int] = None,
+    noise_cfg: Optional[dict] = None,
+    is_train: bool = True,
+    sample_id: Optional[Union[int, torch.Tensor, list, np.integer]] = None,
     stream_id: int = 0,
 ) -> torch.Tensor:
     """
     Inject Poisson photon shot noise and Gaussian readout noise on-the-fly.
+    Supports execution on CPU and GPU (CUDA) devices, for single images or batched tensors.
 
     Parameters
     ----------
     I : torch.Tensor
-        PSF tensor of shape [1, H, W] (pair mode) or [T, H, W] (stack mode).
+        PSF tensor of shape [1, H, W], [T, H, W], [B, 1, H, W], or [B, T, H, W].
         In the consolidated dataset, sum across all T frames is ~1.0 (each frame sum ~ 1/T).
-    T : int
-        Number of frames in sequence.
+    T : int or None
+        Number of frames in sequence. If None, defaults to 1.
     noise_cfg : dict or None
         Configuration dict with keys:
           'enabled' (bool): whether noise injection is active
@@ -34,16 +35,16 @@ def apply_detector_noise(
           'read_noise_e' (float): Gaussian read noise std in electrons (default 0.0)
           'seed' (int): base seed for deterministic val/test noise
     is_train : bool
-        If True, samples stochastic noise independently across calls.
+        If True, samples stochastic noise independently across calls on the tensor's device.
         If False, uses deterministic generator seeded with (base_seed, sample_id, stream_id).
-    sample_id : int
-        Unique sample index for deterministic seeding in eval mode.
+    sample_id : int, Tensor, list, or None
+        Unique sample index (or batch of indices) for deterministic seeding in eval mode.
     stream_id : int
         0 for I1 (intra), 1 for I2 (extra), ensures distinct noise realizations.
 
     Returns
     -------
-    torch.Tensor with same shape and dtype as I.
+    torch.Tensor with same shape, dtype, and device as I.
     """
     if noise_cfg is None or not noise_cfg.get('enabled', False):
         return I
@@ -60,25 +61,51 @@ def apply_detector_noise(
     I_float = I.to(torch.float32)
 
     # Scale frame to unit total flux: each frame sums to ~1.0
-    scale_to_unit = float(max(1, T))
+    scale_to_unit = float(max(1, T)) if T is not None else 1.0
     I_unit = I_float * scale_to_unit
 
     # Expected photon count per pixel
     mu = torch.clamp(I_unit * n_ph, min=0.0)
 
     if is_train:
-        # Stochastic training noise
+        # Stochastic training noise on tensor device (GPU / CPU)
         noisy_counts = torch.poisson(mu)
         if read_noise_e > 0.0:
             noisy_counts = noisy_counts + torch.randn_like(mu) * read_noise_e
     else:
         # Deterministic validation / test noise
-        det_seed = int((base_seed * 1000003 + sample_id * 7919 + stream_id * 31 + 17) & 0x7FFFFFFF)
-        gen = torch.Generator(device='cpu').manual_seed(det_seed)
-        noisy_counts = torch.poisson(mu.cpu(), generator=gen).to(orig_device)
-        if read_noise_e > 0.0:
-            noise_read = torch.randn(mu.shape, generator=gen, dtype=torch.float32).to(orig_device) * read_noise_e
-            noisy_counts = noisy_counts + noise_read
+        # Batched sample_ids matching leading dimension
+        is_batched = (
+            sample_id is not None
+            and mu.dim() >= 2
+            and (
+                (isinstance(sample_id, torch.Tensor) and sample_id.dim() >= 1 and sample_id.shape[0] == mu.shape[0])
+                or (not isinstance(sample_id, torch.Tensor) and hasattr(sample_id, '__len__') and len(sample_id) == mu.shape[0])
+            )
+        )
+        if is_batched:
+            noisy_counts = torch.empty_like(mu)
+            has_read = (read_noise_e > 0.0)
+            sample_ids_list = sample_id.cpu().tolist() if isinstance(sample_id, torch.Tensor) else list(sample_id)
+            for b, s_id in enumerate(sample_ids_list):
+                det_seed = int((base_seed * 1000003 + int(s_id) * 7919 + stream_id * 31 + 17) & 0x7FFFFFFF)
+                gen = torch.Generator(device=orig_device).manual_seed(det_seed)
+                noisy_counts[b] = torch.poisson(mu[b], generator=gen)
+                if has_read:
+                    noisy_counts[b] += torch.randn(mu[b].shape, generator=gen, dtype=torch.float32, device=orig_device) * read_noise_e
+        else:
+            if sample_id is None:
+                s_id = 0
+            elif isinstance(sample_id, torch.Tensor):
+                s_id = int(sample_id.item())
+            else:
+                s_id = int(sample_id)
+            det_seed = int((base_seed * 1000003 + s_id * 7919 + stream_id * 31 + 17) & 0x7FFFFFFF)
+            gen = torch.Generator(device=orig_device).manual_seed(det_seed)
+            noisy_counts = torch.poisson(mu, generator=gen)
+            if read_noise_e > 0.0:
+                noise_read = torch.randn(mu.shape, generator=gen, dtype=torch.float32, device=orig_device) * read_noise_e
+                noisy_counts = noisy_counts + noise_read
 
     # Clamp to non-negative and scale back to original dataset intensity scale
     noisy_counts = torch.clamp(noisy_counts, min=0.0)
@@ -262,10 +289,7 @@ class CWFSDataset(Dataset):
                     I2 = torch.from_numpy(self._psfs_mem[idx, 1].astype(np.float32)).unsqueeze(0)
 
                 sample_id = int(self.indices[idx])
-                I1 = apply_detector_noise(I1, self.T, noise_cfg, is_train, sample_id=sample_id, stream_id=0)
-                I2 = apply_detector_noise(I2, self.T, noise_cfg, is_train, sample_id=sample_id, stream_id=1)
-
-                sample = {'I1': I1, 'I2': I2}
+                sample = {'I1': I1, 'I2': I2, 'sample_id': sample_id}
 
                 if self.compute_r_stack:
                     T = I1.shape[0]
@@ -277,28 +301,27 @@ class CWFSDataset(Dataset):
                 labels = torch.from_numpy(self._labels_mem[idx].astype(np.float32))
             else:
                 # pair-expansion mode
-                T = self.T
-                example_idx = idx // (T * T)
-                frame_i     = (idx // T) % T
-                frame_j     = idx % T
                 if self._temporal:
+                    T = self.T
+                    example_idx = idx // (T * T)
+                    frame_i     = (idx // T) % T
+                    frame_j     = idx % T
                     I1 = torch.from_numpy(
                         self._psfs_mem[example_idx, 0, frame_i].astype(np.float32)
                     ).unsqueeze(0)                                             # [1, H, W]
                     I2 = torch.from_numpy(
                         self._psfs_mem[example_idx, 1, frame_j].astype(np.float32)
                     ).unsqueeze(0)                                             # [1, H, W]
+                    sample_id = int(self.indices[example_idx]) * (T * T) + (frame_i * T + frame_j)
                 else:
+                    example_idx = idx
                     I1 = torch.from_numpy(self._psfs_mem[example_idx, 0].astype(np.float32)).unsqueeze(0)
                     I2 = torch.from_numpy(self._psfs_mem[example_idx, 1].astype(np.float32)).unsqueeze(0)
-
-                sample_id = int(self.indices[example_idx]) * (self.T * self.T) + (frame_i * self.T + frame_j if self._temporal else 0)
-                I1 = apply_detector_noise(I1, self.T, noise_cfg, is_train, sample_id=sample_id, stream_id=0)
-                I2 = apply_detector_noise(I2, self.T, noise_cfg, is_train, sample_id=sample_id + 1000000007, stream_id=1)
+                    sample_id = int(self.indices[example_idx])
 
                 r = (I1 - I2) / (I1 + I2 + EPS_RODDIER)
                 labels = torch.from_numpy(self._labels_mem[example_idx].astype(np.float32)) * self.label_scale
-                sample = {'I1': I1, 'I2': I2, 'r': r}
+                sample = {'I1': I1, 'I2': I2, 'r': r, 'sample_id': sample_id}
 
             # shared label normalisation + mode selection
             if self.label_stats is not None:
@@ -331,10 +354,8 @@ class CWFSDataset(Dataset):
                 I1 = torch.from_numpy(psf_pair[0]).unsqueeze(0)      # [1, H, W]
                 I2 = torch.from_numpy(psf_pair[1]).unsqueeze(0)      # [1, H, W]
 
-            I1 = apply_detector_noise(I1, self.T, noise_cfg, is_train, sample_id=i, stream_id=0)
-            I2 = apply_detector_noise(I2, self.T, noise_cfg, is_train, sample_id=i, stream_id=1)
-
-            sample = {'I1': I1, 'I2': I2}
+            sample_id = i
+            sample = {'I1': I1, 'I2': I2, 'sample_id': sample_id}
 
             # Optionally compute all T² Roddier combinations via broadcasting on CPU.
             if self.compute_r_stack:
@@ -372,15 +393,13 @@ class CWFSDataset(Dataset):
             I2 = torch.from_numpy(
                 self._psfs_ds[i, 1, frame_j].astype(np.float32)
             ).unsqueeze(0)                                      # [1, H, W]
+            sample_id = i * (T * T) + (frame_i * T + frame_j)
         else:
             i = int(self.indices[idx])
             psf_pair = self._psfs_ds[i].astype(np.float32)     # [2, H, W]
             I1 = torch.from_numpy(psf_pair[0]).unsqueeze(0)    # [1, H, W]
             I2 = torch.from_numpy(psf_pair[1]).unsqueeze(0)    # [1, H, W]
-
-        sample_id = i * (self.T * self.T) + (frame_i * self.T + frame_j if self._temporal else 0)
-        I1 = apply_detector_noise(I1, self.T, noise_cfg, is_train, sample_id=sample_id, stream_id=0)
-        I2 = apply_detector_noise(I2, self.T, noise_cfg, is_train, sample_id=sample_id + 1000000007, stream_id=1)
+            sample_id = i
 
         r  = (I1 - I2) / (I1 + I2 + EPS_RODDIER)              # [1, H, W]
 
@@ -396,12 +415,13 @@ class CWFSDataset(Dataset):
         if self.mode_idx is not None:
             labels = labels[self.mode_idx]
 
-        sample = {'I1': I1, 'I2': I2, 'r': r, 'labels': labels}
+        sample = {'I1': I1, 'I2': I2, 'r': r, 'labels': labels, 'sample_id': sample_id}
 
         if self.transform is not None:
             sample = self.transform(sample)
 
         return sample
+
 
 
 # ──────────────────────────────────────────────────────────────────────

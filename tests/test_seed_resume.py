@@ -34,29 +34,43 @@ class TestCheckpointManagerScan(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_scan_and_find_latest_and_best(self):
-        # Create dummy checkpoint files
-        pt1 = self.temp_dir / "epoch005_wfe45.2nm.pt"
-        pt2 = self.temp_dir / "epoch012_wfe38.1nm.pt"
-        pt3 = self.temp_dir / "epoch015_wfe39.0nm.pt"
-        for p in [pt1, pt2, pt3]:
-            torch.save({'epoch': int(p.name[5:8])}, p)
+    def test_save_and_load_resume(self):
+        mgr = CheckpointManager(str(self.temp_dir))
+        self.assertIsNone(mgr.load_resume(torch.device('cpu')))
 
-        mgr = CheckpointManager(str(self.temp_dir), save_top_k=3)
+        mgr.save_resume({'epoch': 5, 'model_state': {}})
+        loaded = mgr.load_resume(torch.device('cpu'))
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded['epoch'], 5)
 
-        latest_ep, latest_path = mgr.latest_checkpoint()
-        self.assertEqual(latest_ep, 15)
-        self.assertEqual(Path(latest_path).name, "epoch015_wfe39.0nm.pt")
+        # Overwriting resume.pt should replace, not accumulate, files
+        mgr.save_resume({'epoch': 6, 'model_state': {}})
+        self.assertEqual(list(self.temp_dir.glob('*.pt')), [mgr.resume_path])
+        loaded = mgr.load_resume(torch.device('cpu'))
+        self.assertEqual(loaded['epoch'], 6)
 
-        best_wfe, best_ep, best_path = mgr.best_checkpoint()
-        self.assertAlmostEqual(best_wfe * 1e9, 38.1, places=1)
-        self.assertEqual(best_ep, 12)
-        self.assertEqual(Path(best_path).name, "epoch012_wfe38.1nm.pt")
+        mgr.clear_resume()
+        self.assertIsNone(mgr.load_resume(torch.device('cpu')))
+
+    def test_save_final_replaces_previous(self):
+        mgr = CheckpointManager(str(self.temp_dir))
+        self.assertIsNone(mgr.final_path())
+
+        path1 = mgr.save_final({'epoch': 12, 'model_state': {}}, metric=38.1e-9)
+        self.assertTrue(Path(path1).exists())
+        self.assertEqual(mgr.final_path(), path1)
+
+        # A better final checkpoint should replace the earlier one on disk
+        path2 = mgr.save_final({'epoch': 15, 'model_state': {}}, metric=30.0e-9)
+        self.assertFalse(Path(path1).exists())
+        self.assertTrue(Path(path2).exists())
+        self.assertEqual(mgr.final_path(), path2)
+        self.assertEqual(len(list(self.temp_dir.glob('final_wfe*nm.pt'))), 1)
 
     def test_empty_dir(self):
-        mgr = CheckpointManager(str(self.temp_dir), save_top_k=3)
-        self.assertEqual(mgr.latest_checkpoint(), (None, None))
-        self.assertEqual(mgr.best_checkpoint(), (None, None, None))
+        mgr = CheckpointManager(str(self.temp_dir))
+        self.assertIsNone(mgr.load_resume(torch.device('cpu')))
+        self.assertIsNone(mgr.final_path())
 
 
 class TestSeedSummaryIO(unittest.TestCase):
@@ -75,7 +89,7 @@ class TestSeedSummaryIO(unittest.TestCase):
             'best_val_wfe': 3.32e-8,
             'best_val_wfe_nm': 33.2,
             'best_epoch': 28,
-            'best_ckpt_path': str(self.temp_dir / "epoch028_wfe33.2nm.pt"),
+            'best_ckpt_path': str(self.temp_dir / "final_wfe33.2nm.pt"),
             'completed_epochs': 30,
             'target_epochs': 30,
             'elapsed_s': 7357.1,
@@ -99,7 +113,7 @@ class TestCheckSeedCompleted(unittest.TestCase):
         shutil.rmtree(self.base_dir, ignore_errors=True)
 
     def test_completed_via_seed_summary(self):
-        ckpt = self.seed_dir / "epoch030_wfe30.0nm.pt"
+        ckpt = self.seed_dir / "final_wfe30.0nm.pt"
         torch.save({'epoch': 30}, ckpt)
 
         data = {
@@ -130,7 +144,7 @@ class TestCheckSeedCompleted(unittest.TestCase):
         self.assertIsNone(res_missing)
 
     def test_completed_via_parent_ensemble_summary(self):
-        ckpt = self.seed_dir / "epoch030_wfe30.0nm.pt"
+        ckpt = self.seed_dir / "final_wfe30.0nm.pt"
         torch.save({'epoch': 30}, ckpt)
 
         ens_summary_path = self.base_dir / "ensemble_summary.yaml"
@@ -159,7 +173,7 @@ class TestCheckSeedCompleted(unittest.TestCase):
         self.assertEqual(summary['seed'], 42)
 
     def test_completed_via_log_and_checkpoint_fallback(self):
-        ckpt = self.seed_dir / "epoch028_wfe33.2nm.pt"
+        ckpt = self.seed_dir / "final_wfe33.2nm.pt"
         torch.save({'epoch': 28}, ckpt)
 
         trial_dir = self.base_dir / "trial_001"
@@ -172,7 +186,7 @@ class TestCheckSeedCompleted(unittest.TestCase):
         # Point seed_dir inside trial_dir/checkpoints/seed_42
         ckpt_dir = trial_dir / "checkpoints" / "seed_42"
         ckpt_dir.mkdir(parents=True)
-        ckpt_in_trial = ckpt_dir / "epoch028_wfe33.2nm.pt"
+        ckpt_in_trial = ckpt_dir / "final_wfe33.2nm.pt"
         torch.save({'epoch': 28}, ckpt_in_trial)
 
         res = _check_seed_completed(ckpt_dir, 42, target_epochs=30, trial_dir=trial_dir)
@@ -249,7 +263,7 @@ class TestTrainSeedSkipping(unittest.TestCase):
         # Mark seed 42 as completed
         s42_dir = self.ckpt_dir / "seed_42"
         s42_dir.mkdir(parents=True)
-        ckpt_42 = s42_dir / "epoch030_wfe30.0nm.pt"
+        ckpt_42 = s42_dir / "final_wfe30.0nm.pt"
         torch.save({'epoch': 30}, ckpt_42)
         write_seed_summary(s42_dir, {
             'seed': 42,
@@ -334,7 +348,7 @@ class TestTrainSeedSkipping(unittest.TestCase):
 
         s42_dir = self.ckpt_dir / "seed_42"
         s42_dir.mkdir(parents=True)
-        ckpt_42 = s42_dir / "epoch030_wfe30.0nm.pt"
+        ckpt_42 = s42_dir / "final_wfe30.0nm.pt"
         torch.save({'epoch': 30}, ckpt_42)
         write_seed_summary(s42_dir, {
             'seed': 42,

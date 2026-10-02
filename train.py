@@ -10,14 +10,19 @@ All config values can be overridden on the command line using the
 --section.key=value syntax (the = is required), e.g.:
     --training.epochs=100  --data.batch_size=64
 
-Checkpoints are saved to config["logging"]["checkpoint_dir"] whenever validation
-total WFE RMS improves.  The top-k best checkpoints are kept; older worse ones
-are deleted automatically.
+Each seed keeps at most two on-disk artifacts under config["logging"]["checkpoint_dir"]:
+  - resume.pt        : single file, overwritten every epoch; holds optimizer/
+                        scheduler/SWA-accumulator state for resuming a preempted
+                        seed.  Deleted once the seed completes.
+  - final_wfe*nm.pt   : single file, written once at the end of training; holds
+                        only the deployed model weights (+ raw weights when SWA
+                        is enabled) needed for evaluation, ensembling, and trial
+                        comparison.  The best-so-far state is tracked in memory
+                        during training rather than written to disk per epoch.
 """
 
 # %%
 import argparse
-import heapq
 import inspect
 import math
 import os
@@ -45,7 +50,8 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
 from dataset import (
-    CWFSDataset, train_val_test_split, subsample_indices, compute_label_stats, get_n_modes
+    CWFSDataset, train_val_test_split, subsample_indices, compute_label_stats, get_n_modes,
+    apply_detector_noise, EPS_RODDIER
 )
 from models.transformer_cwfs import TransformerCWFS
 from models.cnn_cwfs import SIAMCNN, RODCNN, CNNCWFS
@@ -149,13 +155,13 @@ def _resolve_loss_type(cfg: dict) -> str:
     Options:
       - 'wfe_rms' (or 'wfe', 'rms_wfe'): Direct Root-Sum-Square WFE loss in nm
       - 'log_mse' (or 'log_loss', 'ln_mse'): Natural log of MSE
-      - 'mse': Mean Squared Error
+      - 'mse': Mean Squared Error (default)
     """
     tc = cfg.get('training', {})
     dc = cfg.get('data', {})
     for container in (tc, dc):
         for k in ('loss_type', 'criterion'):
-            if k in container:
+            if k in container and container[k] is not None:
                 lt = str(container[k]).lower().strip()
                 if lt in ('wfe_rms', 'wfe', 'rms_wfe', 'rms'):
                     return 'wfe_rms'
@@ -659,78 +665,55 @@ def _lr_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
 # ─────────────────────────────────────────────────────────────────────
 
 class CheckpointManager:
-    """Keeps the best save_top_k checkpoints by ascending metric (lower is better)."""
+    """
+    Manages the two on-disk checkpoint artifacts for a single training seed
+    (see module docstring): a single overwritten `resume.pt` for mid-seed
+    resumption, and a single permanent `final_wfe*nm.pt` for evaluation.
+    """
 
-    def __init__(self, checkpoint_dir: str, save_top_k: int = 3):
+    def __init__(self, checkpoint_dir: str):
         self.dir = Path(checkpoint_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.save_top_k = save_top_k
-        self._heap: list[tuple[float, str]] = []   # (metric, path) — min-heap by negated value
-        self._scan_existing()
+        self.resume_path = self.dir / "resume.pt"
+        existing = sorted(self.dir.glob("final_wfe*nm.pt"))
+        self._final_path: Optional[Path] = existing[0] if existing else None
 
-    def _scan_existing(self) -> None:
-        """Populate heap with existing checkpoints in self.dir."""
-        for pt in self.dir.glob("epoch*.pt"):
-            m = re.search(r"epoch(\d+)_.*wfe([\d\.]+)nm\.pt", pt.name)
-            if m:
-                metric = float(m.group(2)) * 1e-9
-                heapq.heappush(self._heap, (-metric, str(pt)))
-        while len(self._heap) > self.save_top_k:
-            _, worst_path = heapq.heappop(self._heap)
-            try:
-                os.remove(worst_path)
-            except FileNotFoundError:
-                pass
-
-    def save(self, state: dict, metric: float, epoch: int) -> None:
-        path = str(self.dir / f"epoch{epoch:03d}_wfe{metric*1e9:.1f}nm.pt")
-        torch.save(state, path)
-        # heap stores (−metric, path) so that the worst checkpoint sits at top
-        heapq.heappush(self._heap, (-metric, path))
-        if len(self._heap) > self.save_top_k:
-            _, worst_path = heapq.heappop(self._heap)
-            try:
-                os.remove(worst_path)
-            except FileNotFoundError:
-                pass
-
-    def best_path(self) -> str | None:
-        if not self._heap:
+    def load_resume(self, device: torch.device) -> Optional[dict]:
+        """Load the mid-seed resume checkpoint if present, else None."""
+        if not self.resume_path.exists():
             return None
-        return min(self._heap, key=lambda x: x[0])[1]   # smallest −metric = best
+        try:
+            return torch.load(self.resume_path, map_location=device, weights_only=False)
+        except Exception:
+            return None
 
-    def latest_checkpoint(self) -> tuple[Optional[int], Optional[str]]:
-        """Find the checkpoint with the highest epoch number in self.dir."""
-        best_ep = -1
-        best_pt = None
-        for pt in self.dir.glob("epoch*.pt"):
-            m = re.search(r"epoch(\d+)_", pt.name)
-            if m:
-                ep = int(m.group(1))
-                if ep > best_ep:
-                    best_ep = ep
-                    best_pt = str(pt)
-        if best_ep >= 0:
-            return best_ep, best_pt
-        return None, None
+    def save_resume(self, state: dict) -> None:
+        """Atomically overwrite the single mid-seed resume checkpoint."""
+        tmp_path = self.resume_path.with_suffix(".tmp")
+        torch.save(state, tmp_path)
+        tmp_path.replace(self.resume_path)
 
-    def best_checkpoint(self) -> tuple[Optional[float], Optional[int], Optional[str]]:
-        """Returns (best_val_wfe, best_epoch, best_path)."""
-        best_val = float('inf')
-        best_ep = -1
-        best_pt = None
-        for pt in self.dir.glob("epoch*.pt"):
-            m = re.search(r"epoch(\d+)_.*wfe([\d\.]+)nm\.pt", pt.name)
-            if m:
-                ep = int(m.group(1))
-                wfe = float(m.group(2)) * 1e-9
-                if wfe < best_val:
-                    best_val = wfe
-                    best_ep = ep
-                    best_pt = str(pt)
-        if best_pt:
-            return best_val, best_ep, best_pt
-        return None, None, None
+    def clear_resume(self) -> None:
+        """Delete the resume checkpoint once the seed has completed."""
+        try:
+            self.resume_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def save_final(self, state: dict, metric: float) -> str:
+        """Write the single permanent evaluation checkpoint, replacing any previous one."""
+        new_path = self.dir / f"final_wfe{metric*1e9:.1f}nm.pt"
+        torch.save(state, new_path)
+        if self._final_path is not None and self._final_path != new_path:
+            try:
+                self._final_path.unlink()
+            except FileNotFoundError:
+                pass
+        self._final_path = new_path
+        return str(new_path)
+
+    def final_path(self) -> Optional[str]:
+        return str(self._final_path) if self._final_path else None
 
 
 class LogMSELoss(nn.Module):
@@ -787,6 +770,7 @@ def _run_epoch(
     k_pairs_train: int | None = None,
     log_loss: bool = False,
     loss_type: str = 'mse',
+    noise_cfg: Optional[dict] = None,
 ) -> dict:
     """
     Run one epoch.  Returns a dict of scalar metrics.
@@ -797,6 +781,20 @@ def _run_epoch(
     """
     is_rodcnn = model_type.lower() == 'rodcnn'
     model.train(is_train)
+
+    ds = getattr(loader, 'dataset', None)
+    underlying_ds = getattr(ds, 'dataset', ds)
+    if noise_cfg is None and underlying_ds is not None:
+        noise_cfg = getattr(underlying_ds, 'noise_cfg', None)
+    T = getattr(underlying_ds, 'T', 1) if underlying_ds is not None else 1
+
+    # Prepare label stats, selecting the same columns/order as the dataset
+    lm = label_mean.to(device)
+    ls = label_std.to(device)
+    if mode_idx is not None:
+        lm = lm[mode_idx]
+        ls = ls[mode_idx]
+
     if loss_type == 'wfe_rms':
         criterion = RMSWFELoss()
     elif loss_type == 'log_mse' or log_loss:
@@ -811,13 +809,6 @@ def _run_epoch(
     t_last = t0
     last_batch = 0
 
-    # Prepare label stats, selecting the same columns/order as the dataset
-    lm = label_mean.to(device)
-    ls = label_std.to(device)
-    if mode_idx is not None:
-        lm = lm[mode_idx]
-        ls = ls[mode_idx]
-
     if is_train:
         optimizer.zero_grad(set_to_none=True)
 
@@ -831,33 +822,48 @@ def _run_epoch(
             t_data_window += time.time() - t_iter_start
             t_gpu_start = time.time()
 
+            I1 = batch['I1'].to(device, non_blocking=True)
+            I2 = batch['I2'].to(device, non_blocking=True)
+            labels = batch['labels'].to(device, non_blocking=True)
+            sample_id = batch.get('sample_id')
+            if sample_id is not None and isinstance(sample_id, torch.Tensor):
+                sample_id = sample_id.to(device, non_blocking=True)
+
+            if noise_cfg is not None and noise_cfg.get('enabled', False):
+                I1 = apply_detector_noise(I1, T=T, noise_cfg=noise_cfg, is_train=is_train, sample_id=sample_id, stream_id=0)
+                I2 = apply_detector_noise(I2, T=T, noise_cfg=noise_cfg, is_train=is_train, sample_id=sample_id, stream_id=1)
+
             if is_rodcnn:
-                I1 = batch['I1'].to(device, non_blocking=True)
-                I2 = batch['I2'].to(device, non_blocking=True)
-                labels = batch['labels'].to(device, non_blocking=True)  # [B, n_outputs]
                 k_p = k_pairs_train if is_train else None
                 with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
                     pred = model(I1, I2, k_pairs=k_p)                  # [B, n_outputs]
                     loss = criterion(pred, labels) / accumulate_every
             else:
-                I1 = batch['I1'].to(device, non_blocking=True)
-                I2 = batch['I2'].to(device, non_blocking=True)
-                labels = batch['labels'].to(device, non_blocking=True)   # z-scored
                 input_mode = getattr(model, 'input_mode', 'pairs')
                 with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
                     if input_mode == 'two_stream':
                         pred = model(I1, I2)
-                        loss = criterion(pred, labels)
+                        loss = criterion(pred, labels) / accumulate_every
                     elif input_mode == 'r_stack':
-                        R = batch['R'].to(device, non_blocking=True)
+                        if noise_cfg is not None and noise_cfg.get('enabled', False):
+                            T_cnt = I1.shape[1]
+                            I1_exp = I1.unsqueeze(2)
+                            I2_exp = I2.unsqueeze(1)
+                            R = (I1_exp - I2_exp) / (I1_exp + I2_exp + EPS_RODDIER)
+                            R = R.reshape(I1.shape[0], T_cnt * T_cnt, *R.shape[3:])
+                        else:
+                            R = batch['R'].to(device, non_blocking=True)
                         pred = model(R)                        # [B*T², n_outputs]
                         TT = pred.shape[0] // labels.shape[0]
                         labels = labels.repeat_interleave(TT, dim=0)  # [B*T², n_modes]
-                        loss = criterion(pred, labels)
+                        loss = criterion(pred, labels) / accumulate_every
                     else:  # 'pairs' (default)
-                        r  = batch['r'].to(device, non_blocking=True)
+                        if noise_cfg is not None and noise_cfg.get('enabled', False):
+                            r = (I1 - I2) / (I1 + I2 + EPS_RODDIER)
+                        else:
+                            r = batch['r'].to(device, non_blocking=True)
                         pred = model(I1, I2, r)
-                        loss = criterion(pred, labels)
+                        loss = criterion(pred, labels) / accumulate_every
 
             is_last_in_window = ((batch_idx + 1) % accumulate_every == 0) or (batch_idx + 1 == len(loader))
             if is_train:
@@ -874,10 +880,11 @@ def _run_epoch(
                     else:
                         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                         optimizer.step()
-                    if hasattr(scheduler, 'step_batch'):
-                        scheduler.step_batch()
-                    elif not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        scheduler.step()
+                    if scheduler is not None:
+                        if hasattr(scheduler, 'step_batch'):
+                            scheduler.step_batch()
+                        elif not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                            scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.detach() * accumulate_every
@@ -1137,21 +1144,25 @@ def _check_seed_completed(
         except Exception:
             pass
 
-    # 3. Fallback: inspect existing checkpoints and logs
-    pts = list(run_ckpt_dir.glob("epoch*.pt"))
+    # 3. Fallback: inspect existing final checkpoint and logs
+    pts = list(run_ckpt_dir.glob("final_wfe*nm.pt"))
     if pts:
         best_val = float('inf')
         best_ep = -1
         best_pt = None
         for pt in pts:
-            m = re.search(r"epoch(\d+)_.*wfe([\d\.]+)nm\.pt", pt.name)
+            m = re.search(r"wfe([\d\.]+)nm\.pt", pt.name)
             if m:
-                ep = int(m.group(1))
-                wfe_nm = float(m.group(2))
+                wfe_nm = float(m.group(1))
                 if wfe_nm < best_val:
                     best_val = wfe_nm
-                    best_ep = ep
                     best_pt = str(pt)
+        if best_pt:
+            try:
+                ckpt_data = torch.load(best_pt, map_location='cpu', weights_only=False)
+                best_ep = int(ckpt_data.get('epoch', target_epochs))
+            except Exception:
+                best_ep = target_epochs
 
         log_confirmed = False
         log_elapsed_s = 0.0
@@ -1228,6 +1239,7 @@ def _train_single_seed(
     tc = cfg['training']
     lc = cfg['logging']
     mc = cfg['model']
+    noise_cfg = _resolve_noise_config(cfg)
 
     z_score_labels = _resolve_z_score_labels(cfg)
     loss_type = _resolve_loss_type(cfg)
@@ -1285,7 +1297,7 @@ def _train_single_seed(
     use_amp = tc.get('amp', True) and device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
-    ckpt_mgr = CheckpointManager(str(ckpt_dir), save_top_k=lc.get('save_top_k', 3))
+    ckpt_mgr = CheckpointManager(str(ckpt_dir))
 
     es_patience = tc.get('early_stopping_patience', 30)
     es_min_delta = tc.get('early_stopping_min_delta', 0.0)
@@ -1314,38 +1326,33 @@ def _train_single_seed(
 
     best_val_wfe = float('inf')
     best_epoch = -1
+    best_model_state: Optional[dict] = None
+    best_raw_state: Optional[dict] = None
     start_epoch = 1
 
     # Check for mid-seed checkpoint resumption
     if resume_checkpoint:
-        latest_ep, latest_ckpt_path = ckpt_mgr.latest_checkpoint()
-        if latest_ckpt_path is not None and latest_ep is not None and latest_ep < epochs:
+        resume_data = ckpt_mgr.load_resume(device)
+        if resume_data is not None and resume_data.get('epoch', -1) < epochs:
             try:
-                ckpt_data = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
+                latest_ep = resume_data['epoch']
                 raw_model = getattr(model, '_orig_mod', model)
-                if 'raw_model_state' in ckpt_data:
-                    raw_model.load_state_dict(ckpt_data['raw_model_state'])
-                elif 'model_state' in ckpt_data:
-                    raw_model.load_state_dict(ckpt_data['model_state'])
-                if swa is not None and 'swa_state' in ckpt_data:
-                    swa.load_state_dict(ckpt_data['swa_state'])
-                if 'optim_state' in ckpt_data:
-                    optimizer.load_state_dict(ckpt_data['optim_state'])
-                if 'scheduler_state' in ckpt_data and scheduler is not None:
-                    scheduler.load_state_dict(ckpt_data['scheduler_state'])
+                raw_model.load_state_dict(resume_data['model_state'])
+                if swa is not None and 'swa_state' in resume_data:
+                    swa.load_state_dict(resume_data['swa_state'])
+                optimizer.load_state_dict(resume_data['optim_state'])
+                if scheduler is not None and 'scheduler_state' in resume_data:
+                    scheduler.load_state_dict(resume_data['scheduler_state'])
                 start_epoch = latest_ep + 1
-                b_val, b_ep, _ = ckpt_mgr.best_checkpoint()
-                if b_val is not None and b_val < float('inf'):
-                    best_val_wfe = b_val
-                    best_epoch = b_ep
-                else:
-                    best_val_wfe = ckpt_data.get('val_wfe_rms', float('inf'))
-                    best_epoch = latest_ep
-                print(f"  [Resume] Resuming {seed_label} from checkpoint: {Path(latest_ckpt_path).name} (starting at Epoch {start_epoch}/{epochs})")
+                best_val_wfe = resume_data.get('best_val_wfe', float('inf'))
+                best_epoch = resume_data.get('best_epoch', -1)
+                best_model_state = resume_data.get('best_model_state')
+                best_raw_state = resume_data.get('best_raw_state')
+                print(f"  [Resume] Resuming {seed_label} from {ckpt_mgr.resume_path.name} (starting at Epoch {start_epoch}/{epochs})")
                 if recorder is not None:
-                    recorder.log_message(f"[{seed_label}] Resuming from {Path(latest_ckpt_path).name} at Epoch {start_epoch}/{epochs}")
+                    recorder.log_message(f"[{seed_label}] Resuming from {ckpt_mgr.resume_path.name} at Epoch {start_epoch}/{epochs}")
             except Exception as e:
-                print(f"  [Resume Warning] Failed to load checkpoint {latest_ckpt_path}: {e}. Training from Epoch 1.")
+                print(f"  [Resume Warning] Failed to load resume checkpoint: {e}. Training from Epoch 1.")
 
     t_train_start = time.time()
 
@@ -1368,6 +1375,7 @@ def _train_single_seed(
             k_pairs_train=k_pairs_train,
             log_loss=log_loss,
             loss_type=loss_type,
+            noise_cfg=noise_cfg,
         )
 
         if use_swa and epoch >= (epochs - swa_tail_epochs + 1):
@@ -1390,6 +1398,7 @@ def _train_single_seed(
                     k_pairs_train=None,
                     log_loss=log_loss,
                     loss_type=loss_type,
+                    noise_cfg=noise_cfg,
                 )
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -1440,41 +1449,13 @@ def _train_single_seed(
 
                 if swa is not None and swa.n_models > 0:
                     with swa.apply_shadow(raw_model):
-                        save_model_state = raw_model.state_dict()
-                    raw_state = raw_model.state_dict()
-                    swa_state_dict = swa.state_dict()
+                        best_model_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+                    best_raw_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
                 else:
-                    save_model_state = raw_model.state_dict()
-                    raw_state = None
-                    swa_state_dict = None
+                    best_model_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+                    best_raw_state = None
 
-                ckpt_state = {
-                    'epoch':       epoch,
-                    'model_state': save_model_state,
-                    'optim_state': optimizer.state_dict(),
-                    'scheduler_state': scheduler.state_dict(),
-                    'val_wfe_rms': val_wfe,
-                    'label_mean':  label_mean.numpy(),
-                    'label_std':   label_std.numpy(),
-                    'config':      deepcopy(cfg),
-                    'seed':        run_seed,
-                    'z_score_labels': z_score_labels,
-                    'log_loss':    log_loss,
-                }
-                if raw_state is not None:
-                    ckpt_state['raw_model_state'] = raw_state
-                if swa_state_dict is not None:
-                    ckpt_state['swa_state'] = swa_state_dict
-                ckpt_mgr.save(ckpt_state, val_wfe, epoch)
-                saved_path = str(ckpt_mgr.dir / f"epoch{epoch:03d}_wfe{val_wfe*1e9:.1f}nm.pt")
-                print(f"  *** New best val WFE: {val_wfe*1e9:.3f} nm — checkpoint saved ***")
-                if recorder is not None:
-                    recorder.record_checkpoint(
-                        epoch=epoch,
-                        metric_name="val_wfe_rms",
-                        metric_val=val_wfe * 1e9,
-                        checkpoint_path=saved_path,
-                    )
+                print(f"  *** New best val WFE: {val_wfe*1e9:.3f} nm (tracked in memory) ***")
             else:
                 es_counter += 1
                 print(f"  No improvement ({es_counter}/{es_patience})")
@@ -1486,29 +1467,9 @@ def _train_single_seed(
                 best_epoch = epoch
                 es_counter = 0
                 raw_model = getattr(model, '_orig_mod', model)
-                ckpt_state = {
-                    'epoch':       epoch,
-                    'model_state': raw_model.state_dict(),
-                    'optim_state': optimizer.state_dict(),
-                    'scheduler_state': scheduler.state_dict(),
-                    'val_wfe_rms': train_wfe,
-                    'label_mean':  label_mean.numpy(),
-                    'label_std':   label_std.numpy(),
-                    'config':      deepcopy(cfg),
-                    'seed':        run_seed,
-                    'z_score_labels': z_score_labels,
-                    'log_loss':    log_loss,
-                }
-                ckpt_mgr.save(ckpt_state, train_wfe, epoch)
-                saved_path = str(ckpt_mgr.dir / f"epoch{epoch:03d}_train_wfe{train_wfe*1e9:.1f}nm.pt")
-                print(f"  *** [No val] Checkpoint saved (train WFE: {train_wfe*1e9:.3f} nm) ***")
-                if recorder is not None:
-                    recorder.record_checkpoint(
-                        epoch=epoch,
-                        metric_name="train_wfe_rms",
-                        metric_val=train_wfe * 1e9,
-                        checkpoint_path=saved_path,
-                    )
+                best_model_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+                best_raw_state = None
+                print(f"  *** [No val] New best tracked in memory (train WFE: {train_wfe*1e9:.3f} nm) ***")
             else:
                 es_counter += 1
 
@@ -1552,6 +1513,22 @@ def _train_single_seed(
                 lr=optimizer.param_groups[0]['lr'],
             )
 
+        # Persist resume state (single overwritten file) so a preempted seed can continue exactly from here
+        raw_model = getattr(model, '_orig_mod', model)
+        resume_state = {
+            'epoch':           epoch,
+            'model_state':     raw_model.state_dict(),
+            'optim_state':     optimizer.state_dict(),
+            'scheduler_state': scheduler.state_dict(),
+            'best_val_wfe':    best_val_wfe,
+            'best_epoch':      best_epoch,
+            'best_model_state': best_model_state,
+            'best_raw_state':  best_raw_state,
+        }
+        if swa is not None:
+            resume_state['swa_state'] = swa.state_dict()
+        ckpt_mgr.save_resume(resume_state)
+
         if es_counter >= es_patience:
             print(f"  Early stopping triggered after {epoch} epochs.")
             if recorder is not None:
@@ -1574,6 +1551,7 @@ def _train_single_seed(
                 k_pairs_train=None,
                 log_loss=log_loss,
                 loss_type=loss_type,
+                noise_cfg=noise_cfg,
             )
         final_swa_wfe = final_swa_metrics['wfe_rms']
         print(f"  [SWA Final Evaluation] Val WFE: {final_swa_wfe*1e9:.3f} nm (vs previous best: {best_val_wfe*1e9:.3f} nm)")
@@ -1581,30 +1559,41 @@ def _train_single_seed(
             best_val_wfe = final_swa_wfe
             best_epoch = epochs
             with swa.apply_shadow(raw_model):
-                save_model_state = raw_model.state_dict()
-            ckpt_state = {
-                'epoch':       epochs,
-                'model_state': save_model_state,
-                'raw_model_state': raw_model.state_dict(),
-                'swa_state':   swa.state_dict(),
-                'optim_state': optimizer.state_dict(),
-                'scheduler_state': scheduler.state_dict(),
-                'val_wfe_rms': final_swa_wfe,
-                'label_mean':  label_mean.numpy(),
-                'label_std':   label_std.numpy(),
-                'config':      deepcopy(cfg),
-                'seed':        run_seed,
-                'z_score_labels': z_score_labels,
-                'log_loss':    log_loss,
-            }
-            ckpt_mgr.save(ckpt_state, final_swa_wfe, epochs)
-            print(f"  *** [SWA] New best val WFE: {final_swa_wfe*1e9:.3f} nm — checkpoint saved ***")
+                best_model_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+            best_raw_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+            print(f"  *** [SWA] New best val WFE: {final_swa_wfe*1e9:.3f} nm (tracked in memory) ***")
 
     total_elapsed = time.time() - t_train_start
-    best_path = ckpt_mgr.best_path()
+
+    # Write the single permanent checkpoint needed for evaluation/ensembling/comparison
+    if best_model_state is None:
+        raw_model = getattr(model, '_orig_mod', model)
+        best_model_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+    final_ckpt_state = {
+        'epoch':       best_epoch if best_epoch > 0 else epochs,
+        'model_state': best_model_state,
+        'val_wfe_rms': best_val_wfe,
+        'label_mean':  label_mean.numpy(),
+        'label_std':   label_std.numpy(),
+        'config':      deepcopy(cfg),
+        'seed':        run_seed,
+        'z_score_labels': z_score_labels,
+        'log_loss':    log_loss,
+    }
+    if best_raw_state is not None:
+        final_ckpt_state['raw_model_state'] = best_raw_state
+    best_path = ckpt_mgr.save_final(final_ckpt_state, best_val_wfe)
+    ckpt_mgr.clear_resume()
     print(f"\n[{seed_label}] Training complete. Best val WFE: {best_val_wfe*1e9:.1f} nm at epoch {best_epoch} "
           f"(elapsed {total_elapsed/60:.1f} min)")
     print(f"Best checkpoint: {best_path}")
+    if recorder is not None:
+        recorder.record_checkpoint(
+            epoch=best_epoch if best_epoch > 0 else epochs,
+            metric_name="val_wfe_rms",
+            metric_val=best_val_wfe * 1e9,
+            checkpoint_path=best_path,
+        )
 
     # Save seed_summary.yaml
     seed_summary_data = {
@@ -1925,6 +1914,7 @@ def train(cfg: dict) -> None:
                 model, test_loader, lm_eval, ls_eval, device,
                 labels_are_zscored=True,
                 tta=use_tta, trained_modes=trained_modes,
+                noise_cfg=noise_cfg,
             )
             final_test_metrics = _metrics_table(pred, target)
             header_str = f"Test Set Evaluation: Best Model (Seed {best_run['seed']})" if is_ensemble else "Test Set Evaluation"
@@ -1955,6 +1945,7 @@ def train(cfg: dict) -> None:
                     model, test_loader, lm_eval, ls_eval, device,
                     labels_are_zscored=True,
                     tta=use_tta, trained_modes=trained_modes,
+                    noise_cfg=noise_cfg,
                 )
                 all_preds.append(pred)
                 m = _metrics_table(pred, test_target)
@@ -2120,6 +2111,8 @@ def _parse_args(cmd_args=None):
                         help="Alias for --photons_per_frame")
     parser.add_argument('--read_noise_e', type=float, default=None,
                         help="Gaussian readout noise std in RMS electrons (e.g. 2.0)")
+    parser.add_argument('--loss_type', choices=['mse', 'log_mse', 'wfe_rms'], default=None,
+                        help="Loss function criterion to optimize during training")
     # absorb arbitrary key=value overrides
     args, overrides = parser.parse_known_args(cmd_args)
     return args, overrides
@@ -2191,6 +2184,8 @@ if __name__ == '__main__':
         overrides.append(f'model.base_ch={args.base_ch}')
     if args.stage_blocks is not None:
         overrides.append(f'model.stage_blocks={args.stage_blocks}')
+    if args.loss_type is not None:
+        overrides.append(f'training.loss_type={args.loss_type}')
 
     cfg = _apply_overrides(cfg, overrides)
     train(cfg)
