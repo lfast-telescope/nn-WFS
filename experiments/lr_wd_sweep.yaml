@@ -20,7 +20,6 @@ common_overrides:
   training.scheduler.min_lr: 1.0e-6
   training.swa: true
   logging.sparse_record: true
-  logging.save_top_k: 2
   evaluation.tta: true
   ensemble.seeds: 2
   ensemble.mode: average

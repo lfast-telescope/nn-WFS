@@ -22,7 +22,6 @@ common_overrides:
   training.swa: true
   training.swa_tail_epochs: 5
   logging.sparse_record: true
-  logging.save_top_k: 2
   evaluation.tta: true
   ensemble.seeds: 2
   ensemble.mode: average

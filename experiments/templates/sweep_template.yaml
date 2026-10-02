@@ -16,7 +16,6 @@ common_overrides:
   training.epochs: 50
   training.validate: true
   logging.sparse_record: true
-  logging.save_top_k: 2
 
 # Parameter sweep definition: EITHER 'matrix' (Cartesian grid) OR 'trials' (explicit list)
 matrix:

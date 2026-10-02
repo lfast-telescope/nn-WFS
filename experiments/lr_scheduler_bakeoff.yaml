@@ -17,7 +17,6 @@ common_overrides:
   training.validate: true
   training.warmup_steps: 500
   logging.sparse_record: true
-  logging.save_top_k: 2
   ensemble.seeds: 3
   ensemble.mode: average
 

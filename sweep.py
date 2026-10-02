@@ -376,7 +376,7 @@ def inspect_trial_checkpoint(trial: TrialSpec) -> None:
             pass
 
     # Scan .pt files
-    pts = list(ckpt_dir.glob("*.pt"))
+    pts = list(ckpt_dir.rglob("final_wfe*nm.pt"))
     if not pts:
         return
 
@@ -385,17 +385,21 @@ def inspect_trial_checkpoint(trial: TrialSpec) -> None:
     best_ep = -1
 
     for pt in pts:
-        # Match pattern: epoch005_wfe12.3nm.pt
-        m = re.search(r"epoch(\d+)_wfe([\d\.]+)nm\.pt", pt.name)
+        # Match pattern: final_wfe12.3nm.pt
+        m = re.search(r"wfe([\d\.]+)nm\.pt", pt.name)
         if m:
-            ep = int(m.group(1))
-            wfe = float(m.group(2))
+            wfe = float(m.group(1))
             if wfe < best_wfe:
                 best_wfe = wfe
                 best_pt = pt
-                best_ep = ep
 
     if best_pt:
+        try:
+            import torch
+            ckpt_data = torch.load(best_pt, map_location='cpu', weights_only=False)
+            best_ep = int(ckpt_data.get('epoch', -1))
+        except Exception:
+            best_ep = -1
         trial.best_val_wfe_nm = best_wfe
         trial.best_epoch = best_ep
         trial.best_checkpoint = str(best_pt)

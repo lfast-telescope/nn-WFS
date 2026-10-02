@@ -45,7 +45,6 @@ logging:
   sparse_dir: logs/rodcnn_raw_wfe
   sparse_dir: nn_WFS/tmp
   log_interval: 1000
-  save_top_k: 2
   sparse_record: true
 
 ensemble:

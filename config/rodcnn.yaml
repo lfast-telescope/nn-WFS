@@ -40,6 +40,7 @@ training:
   validate: true         # Set false to skip validation epochs; true to re-enable
   val_sample_ratio: 0.5  # Evaluate 80% of validation examples to lower validation time (0.0 < ratio <= 1.0)
   log_loss: false        # Return loss function as ln(MSE); false returns standard MSE
+  loss_type: "mse"       # Options: "mse", "log_mse", "wfe_rms" (default: "mse")
   swa: false             # Stochastic Weight Averaging in tail epochs (default: false)
   swa_tail_epochs: 5     # Number of tail epochs to average into SWA model
 
@@ -59,7 +60,6 @@ evaluation:
 logging:
   checkpoint_dir: checkpoints/rodcnn
   log_interval: 1000
-  save_top_k: 3
 
 # Optional multi-seed ensemble training & evaluation:
 # - If omitted or null -> single run with seed=42

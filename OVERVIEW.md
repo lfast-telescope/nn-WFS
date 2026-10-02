@@ -219,7 +219,7 @@ attrs  : label_units = 'metres_opd', n_modes = <int>
 | **Loss** | MSE ($L_2$) on z-scored labels | Optimized for minimum WFE variance across modes |
 | **Mixed Precision** | PyTorch AMP (`torch.amp.GradScaler`) | Automatic mixed precision for CUDA acceleration |
 | **JIT Compilation** | `torch.compile(mode=...)` | `reduce-overhead` (Transformer/CNN/Toy) or `default` (RODCNN) |
-| **Checkpoints** | `CheckpointManager` | Automatically tracks and retains top-$k$ best checkpoints by validation WFE RMS |
+| **Checkpoints** | `CheckpointManager` | Tracks the best model in memory during training; writes a single `resume.pt` (overwritten each epoch, deleted on completion) and one permanent `final_wfe*nm.pt` per seed |
 | **Early Stopping** | Patience (e.g. 30 epochs), min delta | Early termination if validation WFE ceases to improve |
 
 ---

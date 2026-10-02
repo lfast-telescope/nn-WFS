@@ -109,6 +109,10 @@ class TrialComparisonRecord:
     dist_stats: Optional[DistributionStats] = None
 
     def __post_init__(self):
+        if self.best_val_wfe_nm is None:
+            self.best_val_wfe_nm = float('inf')
+        if self.val_wfe_mean_nm is None:
+            self.val_wfe_mean_nm = float('inf')
         if self.val_wfe_mean_nm == float('inf') and self.best_val_wfe_nm != float('inf'):
             self.val_wfe_mean_nm = self.best_val_wfe_nm
         if self.best_val_wfe_nm == float('inf') and self.val_wfe_mean_nm != float('inf'):
@@ -194,7 +198,11 @@ def extract_trial_record(trial_dir: Path, target_wfe_nm: float = 45.0) -> TrialC
     trial_name = summary_data.get('trial_name', trial_dir.name)
     status = summary_data.get('status', 'UNKNOWN')
     elapsed_s = summary_data.get('elapsed_s', 0.0)
-    best_val_wfe_nm = summary_data.get('best_val_wfe_nm', float('inf'))
+    # Failed/crashed trials write these as explicit `null`, so `.get(..., default)`
+    # does not apply; coalesce None -> inf explicitly.
+    best_val_wfe_nm = summary_data.get('best_val_wfe_nm')
+    if best_val_wfe_nm is None:
+        best_val_wfe_nm = float('inf')
     best_epoch = summary_data.get('best_epoch', -1)
     best_checkpoint = summary_data.get('best_checkpoint')
     overrides = summary_data.get('overrides', {})
@@ -251,13 +259,16 @@ def extract_trial_record(trial_dir: Path, target_wfe_nm: float = 45.0) -> TrialC
     if not best_checkpoint:
         ckpt_dir = trial_dir / "checkpoints"
         if ckpt_dir.exists():
-            pts = list(ckpt_dir.glob("*.pt"))
+            pts = list(ckpt_dir.rglob("final_wfe*nm.pt"))
             if pts:
                 best_checkpoint = str(sorted(pts, key=lambda p: p.stat().st_mtime)[-1])
 
     # Check ensemble_summary.yaml for multi-seed statistics and ensemble test metrics
     ens_summary = ckpt_dir / "ensemble_summary.yaml"
-    val_wfe_mean_nm = summary_data.get('val_wfe_mean_nm', float('inf'))
+    # Same explicit-null issue as best_val_wfe_nm above.
+    val_wfe_mean_nm = summary_data.get('val_wfe_mean_nm')
+    if val_wfe_mean_nm is None:
+        val_wfe_mean_nm = float('inf')
     val_wfe_std_nm = summary_data.get('val_wfe_std_nm', 0.0)
     num_seeds = summary_data.get('num_seeds', 1)
     ensemble_test_wfe_nm = None
