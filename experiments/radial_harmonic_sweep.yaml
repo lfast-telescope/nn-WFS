@@ -1,0 +1,43 @@
+# Training Dataset Size Experiment Sweep (Fig 13 Scaling Law)
+name: "radial_harmonic_sweep"
+description: "Evaluate affect of including explicit radial harmonic terms"
+
+# Base configuration to inherit from
+base_config: "config/rodcnn.yaml"
+
+# Output root directory for this experiment suite
+output_root: "experiments/results/radial_harmonic_sweep"
+
+# Target WFE threshold in nanometers for evaluating convergence velocity
+target_wfe_nm: 35.0
+
+# Slurm cluster parameters (defaults for UA HPC Puma / cbender allocation)
+slurm:
+  account: "cbender"
+  partition: "gpu_high_priority"
+  qos: "user_qos_cbender"
+  cpus_per_task: 4
+  gres: "gpu:nvidia_a100_80gb_pcie_3g.40gb"
+
+# Global overrides applied to all trials in this sweep
+common_overrides:
+  training.epochs: 30
+  training.lr: 1.0e-3
+  training.weight_decay: 0.03
+  training.betas: [0.9, 0.999]
+  model.dropout: 0.0
+  training.warmup_steps: 500
+  training.scheduler.type: "cosine"
+  training.scheduler.min_lr: 1.0e-6
+  training.swa: true
+  training.swa_tail_epochs: 5
+  logging.sparse_record: true
+  evaluation.tta: true
+  ensemble.seeds: 2
+  ensemble.mode: average
+
+# Parameter matrix: 4 trials sweeping training k_pairs
+matrix:
+  model.radial_profile.enabled: [false, true]
+  model.stem_stride: [1,2]
+

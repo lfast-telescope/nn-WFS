@@ -1,0 +1,62 @@
+# Phase 7 — Asymptotic 25nm Ablation Sweep
+name: "asymptote_ablation_sweep"
+description: "4-trial factorial ablation sweep testing CoordConv, 2x2 spatial quadrant pooling, and Variance-Weighted MSE to lower theoretical performance asymptote from 30.19 nm to 25.0 nm (2 seeds, 50 epochs, cosine_tail scheduler)"
+
+base_config: "config/rodcnn.yaml"
+output_root: "experiments/results/asymptote_ablation_sweep"
+target_wfe_nm: 30.0
+
+slurm:
+  account: "cbender"
+  partition: "gpu_high_priority"
+  qos: "user_qos_cbender"
+  cpus_per_task: 4
+  gres: "gpu:nvidia_a100_80gb_pcie_3g.40gb"
+
+common_overrides:
+  model.base_ch: 48
+  model.stage_blocks: 2
+  model.stem_stride: 2
+  model.k_pairs_train: 8
+  model.dropout: 0.0
+  data.z_score_labels: true
+  data.noise.enabled: false
+  training.epochs: 50
+  training.lr: 1.0e-3
+  training.weight_decay: 0.03
+  training.betas: [0.9, 0.999]
+  training.warmup_steps: 500
+  training.scheduler.type: "cosine_tail"
+  training.scheduler.tail_ratio: 0.20
+  training.scheduler.min_lr: 1.0e-6
+  training.swa: true
+  training.swa_tail_epochs: 5
+  logging.sparse_record: true
+  evaluation.tta: true
+  ensemble.seeds: 2
+  ensemble.mode: average
+
+trials:
+  - name: "baseline_rodcnn"
+    overrides:
+      model.coord_conv: false
+      model.pooling: "gap"
+      training.loss_type: "mse"
+
+  - name: "weighted_mse_only"
+    overrides:
+      model.coord_conv: false
+      model.pooling: "gap"
+      training.loss_type: "weighted_mse"
+
+  - name: "coordconv_quadrant_only"
+    overrides:
+      model.coord_conv: true
+      model.pooling: "quadrant"
+      training.loss_type: "mse"
+
+  - name: "full_proposed_model"
+    overrides:
+      model.coord_conv: true
+      model.pooling: "quadrant"
+      training.loss_type: "weighted_mse"
