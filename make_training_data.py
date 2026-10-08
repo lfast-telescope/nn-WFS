@@ -45,10 +45,11 @@ from typing import Optional, Tuple
 import h5py
 import numpy as np
 import yaml
-from scipy.ndimage import rotate, zoom
+from scipy.ndimage import rotate
 
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
@@ -58,6 +59,7 @@ from utils.sparse_recorder import SparseRecorder
 try:
     from hcipy import (
         Apodizer,
+        Configuration,
         Field,
         FraunhoferPropagator,
         InfiniteAtmosphericLayer,
@@ -70,6 +72,13 @@ try:
         make_zernike_basis,
     )
     from hcipy.atmosphere import Cn_squared_from_fried_parameter
+
+    # Optimization 2: Precompute MFT transformation matrices and allocate intermediate buffers
+    try:
+        Configuration().fourier.mft.precompute_matrices = True
+        Configuration().fourier.mft.allocate_intermediate = True
+    except Exception:
+        pass
 except ImportError as e:
     sys.exit(
         f"hcipy is required to generate training data. "
@@ -112,14 +121,23 @@ except Exception:
 
 class _NS(dict):
     """Dot-access dict for nested config."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for k, v in list(self.items()):
+            if isinstance(v, dict) and not isinstance(v, _NS):
+                self[k] = _NS(v)
+            elif isinstance(v, list):
+                self[k] = [_NS(item) if isinstance(item, dict) and not isinstance(item, _NS) else item for item in v]
+
     def __getattr__(self, key):
         try:
-            val = self[key]
-            return _NS(val) if isinstance(val, dict) else val
+            return self[key]
         except KeyError:
             raise AttributeError(key)
 
     def __setattr__(self, key, value):
+        if isinstance(value, dict) and not isinstance(value, _NS):
+            value = _NS(value)
         self[key] = value
 
 
@@ -202,7 +220,7 @@ def build_optics(cfg: _NS):
 
     focal_grid = make_focal_grid(
         q, num_airy,
-        spatial_resolution=wl_ref / OD,
+        spatial_resolution=wl_ref * focal_ratio,
     )
     prop = FraunhoferPropagator(pupil_grid, focal_grid, focal_length=focal_length)
 
@@ -261,76 +279,122 @@ def draw_coefficients(cfg: _NS, rng: np.random.Generator) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Tolerancing parameter sampler
+# Modular Defocus & Tolerancing parameter sampler
 # ──────────────────────────────────────────────────────────────────────────────
+
+def get_defocus_distances(cfg: _NS) -> list[float]:
+    """Return list of nominal defocus distances (metres) from config."""
+    if 'defocus_distances_m' in cfg.optics:
+        distances = [float(d) for d in cfg.optics.defocus_distances_m]
+    elif 'delta_z1' in cfg.optics:
+        dz1 = float(cfg.optics.delta_z1)
+        dz2 = float(cfg.optics.get('delta_z2', 2.0 * dz1))
+        distances = [dz1, dz2]
+    else:
+        dz = float(cfg.optics.get('delta_z', 0.369e-3))
+        distances = [dz, 2.0 * dz]
+    return distances
+
+
+def get_channel_metadata(cfg: _NS) -> tuple[list[str], list[str], list[float], bool]:
+    """
+    Return (channel_names, metric_tags, nominal_distances, include_focal).
+    
+    Channel names follow the requested format:
+      [Ii1, -Ii1, Iii1, -Iii1, Iiii1, -Iiii1, ..., Ifocal]
+    Metric tags follow signed metric notation:
+      ['+0.369mm', '-0.369mm', ..., '0.000mm']
+    """
+    distances = get_defocus_distances(cfg)
+    include_focal = bool(cfg.optics.get('include_focal', True))
+
+    roman_numerals = ['i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix', 'x']
+    channel_names = []
+    metric_tags = []
+
+    for k, d in enumerate(distances):
+        r = roman_numerals[k] if k < len(roman_numerals) else f"p{k+1}"
+        channel_names.append(f"I{r}1")
+        channel_names.append(f"-I{r}1")
+        d_mm = d * 1e3
+        metric_tags.append(f"+{d_mm:.3f}mm")
+        metric_tags.append(f"-{d_mm:.3f}mm")
+
+    if include_focal:
+        channel_names.append("Ifocal")
+        metric_tags.append("0.000mm")
+
+    return channel_names, metric_tags, distances, include_focal
+
 
 def sample_tolerancing_parameters(cfg: _NS, rng: np.random.Generator, c4_factor: float) -> dict:
     """
     Sample physical optical and atmospheric tolerancing parameters for one example.
+    Supports arbitrary defocus planes and absolute ±40 um uncertainty.
     """
+    distances = get_defocus_distances(cfg)
+    include_focal = bool(cfg.optics.get('include_focal', True))
     tol_cfg = cfg.get('tolerancing', {})
     is_enabled = tol_cfg.get('enabled', False)
 
+    dz_unc = float(tol_cfg.get('dz_uncertainty_m', 40.0e-6))
+    dtheta_max = float(tol_cfg.get('dtheta', {}).get('max_deg', 2.0))
+    seeing_cfg = tol_cfg.get('seeing', {})
+    r0_min = float(seeing_cfg.get('r0_min', 0.08))
+    r0_max = float(seeing_cfg.get('r0_max', 0.16))
+
     if not is_enabled:
-        dz1_nom = float(cfg.optics.get('delta_z1', cfg.optics.delta_z))
-        dz2_nom = float(cfg.optics.get('delta_z2', 2.0 * dz1_nom))
-        asym = 0.0
+        asym = np.zeros(len(distances), dtype=np.float64)
         dtheta = 0.0
         r0 = float(cfg.atmosphere.r0_500nm)
         regime = "nominal"
     else:
-        # dz1
-        dz1_cfg = tol_cfg.get('dz1', {})
-        dz1_nom = float(dz1_cfg.get('nominal', cfg.optics.get('delta_z1', cfg.optics.delta_z)))
-        dz1_pct = float(dz1_cfg.get('range_pct', 0.10))
-        dz1 = rng.uniform(dz1_nom * (1.0 - dz1_pct), dz1_nom * (1.0 + dz1_pct))
-
-        # dz2
-        dz2_cfg = tol_cfg.get('dz2', {})
-        dz2_nom = float(dz2_cfg.get('nominal', cfg.optics.get('delta_z2', 2.0 * dz1_nom)))
-        dz2_pct = float(dz2_cfg.get('range_pct', 0.10))
-        dz2 = rng.uniform(dz2_nom * (1.0 - dz2_pct), dz2_nom * (1.0 + dz2_pct))
-
-        # Asymmetry: shared axial zero-point offset between intra/extra
-        asym_max = float(tol_cfg.get('asymmetry', {}).get('max_m', 40.0e-6))
-        asym = rng.uniform(-asym_max, +asym_max)
-
-        # Camera clocking error
-        dtheta_max = float(tol_cfg.get('dtheta', {}).get('max_deg', 2.0))
+        # Absolute uncertainty: uniform [-dz_unc, +dz_unc] per plane
+        asym = rng.uniform(-dz_unc, +dz_unc, size=len(distances))
         dtheta = rng.uniform(-dtheta_max, +dtheta_max)
-
-        # Seeing conditions
-        seeing_cfg = tol_cfg.get('seeing', {})
-        r0_min = float(seeing_cfg.get('r0_min', 0.08))
-        r0_max = float(seeing_cfg.get('r0_max', 0.16))
         r0 = rng.uniform(r0_min, r0_max)
         regime = "toleranced"
 
-        dz1_nom = dz1
-        dz2_nom = dz2
+    sampled_dz = []
+    sampled_c4 = []
 
-    # Derived physical camera positions:
-    dz_i1  = dz1_nom + 0.5 * asym
-    dz_i2  = dz1_nom - 0.5 * asym
-    dz_ii1 = dz2_nom + 0.5 * asym
-    dz_ii2 = dz2_nom - 0.5 * asym
+    for k, d_nom in enumerate(distances):
+        dz_intra = float(d_nom + 0.5 * asym[k])
+        dz_extra = float(d_nom - 0.5 * asym[k])
+        sampled_dz.append(dz_intra)
+        sampled_dz.append(dz_extra)
+        sampled_c4.append(dz_intra * c4_factor)
+        sampled_c4.append(dz_extra * c4_factor)
 
-    return {
-        'dz1_nominal':  float(dz1_nom),
-        'dz2_nominal':  float(dz2_nom),
-        'dz_asymmetry': float(asym),
-        'dtheta_deg':   float(dtheta),
-        'r0':           float(r0),
-        'dz_i1':        float(dz_i1),
-        'dz_i2':        float(dz_i2),
-        'dz_ii1':       float(dz_ii1),
-        'dz_ii2':       float(dz_ii2),
-        'c4_i1':        float(dz_i1 * c4_factor),
-        'c4_i2':        float(dz_i2 * c4_factor),
-        'c4_ii1':       float(dz_ii1 * c4_factor),
-        'c4_ii2':       float(dz_ii2 * c4_factor),
-        'regime':       regime,
+    if include_focal:
+        sampled_dz.append(0.0)
+        sampled_c4.append(0.0)
+
+    res = {
+        'nominal_distances': distances,
+        'dz_asymmetry': [float(a) for a in asym],
+        'dtheta_deg': float(dtheta),
+        'r0': float(r0),
+        'sampled_dz': sampled_dz,
+        'sampled_c4': sampled_c4,
+        'regime': regime,
     }
+
+    # Backward compatibility keys for 2-distance configs:
+    if len(distances) >= 2:
+        res['dz1_nominal']  = float(distances[0])
+        res['dz2_nominal']  = float(distances[1])
+        res['dz_asymmetry'] = float(asym[0])
+        res['dz_i1']        = sampled_dz[0]
+        res['dz_i2']        = sampled_dz[1]
+        res['dz_ii1']       = sampled_dz[2]
+        res['dz_ii2']       = sampled_dz[3]
+        res['c4_i1']        = sampled_c4[0]
+        res['c4_i2']        = sampled_c4[1]
+        res['c4_ii1']       = sampled_c4[2]
+        res['c4_ii2']       = sampled_c4[3]
+
+    return res
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -449,7 +513,7 @@ def propagate_polychromatic(
     for frame_i in range(n_frames):
         broadband_integrated = np.zeros((raw_size, raw_size), dtype=np.float64)
         for sub_j in range(n_sub):
-            t_sample  = frame_i * t_frame + sub_j * tau_0 if tau_0 is not None else 0.0
+            t_sample  = 2 * frame_i * t_frame + sub_j * tau_0 if tau_0 is not None else 0.0 #add factor 2 to ensure decorrelation
             atm_opd   = get_atm_opd(atm, t_sample, wl_ref, atm_scale=atm_scale)
             total_opd = static_opd + atm_opd if atm_opd is not None else static_opd
 
@@ -462,12 +526,7 @@ def propagate_polychromatic(
                 if Ngrid_foc is None:
                     Ngrid_foc = int(round(math.sqrt(len(psf_field))))
                 psf_2d = np.array(psf_field).reshape(Ngrid_foc, Ngrid_foc)
-                scale = wl / wl_ref
-                if abs(scale - 1.0) < 1e-9:
-                    psf_phys = psf_2d
-                else:
-                    psf_phys = zoom(psf_2d, scale, order=3, mode='constant', cval=0.0)
-                broadband_sub += wt * _centre_crop_or_pad(psf_phys, raw_size)
+                broadband_sub += wt * _centre_crop_or_pad(psf_2d, raw_size)
             broadband_integrated += broadband_sub
 
         frames[frame_i] = broadband_integrated
@@ -500,6 +559,52 @@ def _apply_rotation(seq: np.ndarray, dtheta_deg: float) -> np.ndarray:
     return rotated
 
 
+def save_verification_plot(
+    psfs_frame0: np.ndarray,
+    channel_names: list[str],
+    metric_tags: list[str],
+    ex_idx: int,
+    n_examples: int,
+    ex_time: float,
+    out_path: str | Path,
+) -> None:
+    """
+    Save multi-plane verification PNG plot for the current example.
+
+    Matches the format of modular_dry_run_verification.png with 2 rows of subplots,
+    square-root intensity stretch, magma colormap, and channel titles with metric tags.
+    Overwrites out_path on each invocation.
+    """
+    clean_ch_names = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in channel_names]
+    clean_metric_tags = [m.decode('utf-8') if isinstance(m, bytes) else str(m) for m in metric_tags]
+    n_channels = len(clean_ch_names)
+    n_cols = max(1, math.ceil(n_channels / 2))
+
+    fig, axes = plt.subplots(2, n_cols, figsize=(3 * n_cols, 6))
+    axes = np.atleast_1d(axes).flatten()
+
+    for i in range(n_channels):
+        img = psfs_frame0[i].astype(np.float32)
+        axes[i].imshow(np.sqrt(np.maximum(img, 0.0)), cmap='magma', origin='lower')
+        axes[i].set_title(f"{clean_ch_names[i]}\n({clean_metric_tags[i]})", fontsize=10)
+        axes[i].axis('off')
+
+    for j in range(n_channels, len(axes)):
+        axes[j].axis('off')
+
+    plt.suptitle(
+        f"Modular Multi-Plane CWFS Verification — Example {ex_idx + 1}/{n_examples} "
+        f"(Gen Time: {ex_time:.2f}s, Sqrt Scale)",
+        fontsize=13,
+    )
+    plt.tight_layout()
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main generation loop
 # ──────────────────────────────────────────────────────────────────────────────
@@ -517,6 +622,15 @@ def main(
     n_modes          = int(cfg.zernike.n_modes)
     chunk            = int(cfg.simulation.hdf5_chunk_size)
     seed_base        = int(cfg.simulation.random_seed) + task_id * 10000
+
+    output_tmp_plots = bool(cfg.simulation.get('output_tmp_plots', cfg.get('output_tmp_plots', False)))
+    tmp_plot_path_cfg = cfg.simulation.get('tmp_plot_path', cfg.get('tmp_plot_path', None))
+    if tmp_plot_path_cfg is not None:
+        tmp_plot_path = Path(tmp_plot_path_cfg)
+    else:
+        prefix = "modular_dry_run_verification" if dry_run else "modular_verification"
+        plot_name = f"{prefix}.png" if n_tasks == 1 else f"{prefix}_task{task_id:03d}.png"
+        tmp_plot_path = Path("tmp") / plot_name
 
     # Number of examples for this task/shard
     n_examples = n_examples_total // n_tasks if n_tasks > 1 else n_examples_total
@@ -552,15 +666,21 @@ def main(
         local_write_path = final_target_path
         use_staging = False
 
+    channel_names, metric_tags, nominal_distances, include_focal = get_channel_metadata(cfg)
+    n_channels = len(channel_names)
+
     print(f"\n{'='*70}")
     print(f"CWFS DATA GENERATION (Task {task_id + 1}/{n_tasks})")
     print(f"{'='*70}")
     print(f"Target Examples  : {n_examples:,}")
-    print(f"Output Channels  : 5 ([Ii1, Ii2, Iii1, Iii2, focal])")
+    print(f"Output Channels  : {n_channels} ({', '.join(channel_names)})")
+    print(f"Metric Tags      : {', '.join(metric_tags)}")
     print(f"Frames / Example : {t_frames}")
     print(f"Resolution       : {img_size}×{img_size} px")
     print(f"Random Seed      : {seed_base}")
     print(f"Local Write Path : {local_write_path}")
+    if output_tmp_plots:
+        print(f"Output Tmp Plots : Enabled -> {tmp_plot_path} (overwritten each example)")
     if use_staging:
         print(f"Final Target Path: {final_target_path}")
     print(f"{'='*70}\n")
@@ -587,18 +707,20 @@ def main(
 
     try:
         with h5py.File(local_write_path, 'w') as f:
-            # 5-channel PSF dataset: [N, 5, T, H, W]
+            # Multi-channel PSF dataset: [N, n_channels, T, H, W]
             ds_psfs = f.create_dataset(
                 'psfs',
-                shape=(n_examples, 5, t_frames, img_size, img_size),
+                shape=(n_examples, n_channels, t_frames, img_size, img_size),
                 dtype='float16',
-                chunks=(1, 5, t_frames, img_size, img_size),
+                chunks=(1, n_channels, t_frames, img_size, img_size),
                 compression='gzip', compression_opts=4,
             )
-            ds_psfs.attrs['channels'] = ['Ii1', 'Ii2', 'Iii1', 'Iii2', 'focal']
-            ds_psfs.attrs['has_channel_ii'] = True
-            ds_psfs.attrs['has_focal_psf'] = True
-            ds_psfs.attrs['channel_indices'] = [0, 1, 2, 3, 4]
+            ds_psfs.attrs['channels'] = [c.encode('utf-8') for c in channel_names]
+            ds_psfs.attrs['metric_tags'] = [m.encode('utf-8') for m in metric_tags]
+            ds_psfs.attrs['channel_indices'] = list(range(n_channels))
+            ds_psfs.attrs['nominal_defocus_m'] = np.array(nominal_distances, dtype='float32')
+            ds_psfs.attrs['include_focal'] = include_focal
+            ds_psfs.attrs['has_focal_psf'] = include_focal
 
             # Labels dataset: [N, n_modes]
             ds_labels = f.create_dataset(
@@ -614,21 +736,28 @@ def main(
 
             # /attributes group for physical tolerancing & regime tracking
             grp_attr = f.create_group('attributes')
-            ds_dz1_nom = grp_attr.create_dataset('dz1_nominal', shape=(n_examples,), dtype='float32')
-            ds_dz2_nom = grp_attr.create_dataset('dz2_nominal', shape=(n_examples,), dtype='float32')
-            ds_asym    = grp_attr.create_dataset('dz_asymmetry', shape=(n_examples,), dtype='float32')
-            ds_dtheta  = grp_attr.create_dataset('dtheta_deg', shape=(n_examples,), dtype='float32')
-            ds_r0      = grp_attr.create_dataset('r0', shape=(n_examples,), dtype='float32')
-            ds_dzi1    = grp_attr.create_dataset('dz_i1', shape=(n_examples,), dtype='float32')
-            ds_dzi2    = grp_attr.create_dataset('dz_i2', shape=(n_examples,), dtype='float32')
-            ds_dzii1   = grp_attr.create_dataset('dz_ii1', shape=(n_examples,), dtype='float32')
-            ds_dzii2   = grp_attr.create_dataset('dz_ii2', shape=(n_examples,), dtype='float32')
-            ds_regime  = grp_attr.create_dataset('regime', shape=(n_examples,), dtype=h5py.string_dtype(encoding='utf-8'))
+            ds_nom_dz   = grp_attr.create_dataset('nominal_defocus_m', data=np.array(nominal_distances, dtype='float32'))
+            ds_samp_dz  = grp_attr.create_dataset('sampled_defocus_m', shape=(n_examples, n_channels), dtype='float32')
+            ds_samp_c4  = grp_attr.create_dataset('sampled_c4_m', shape=(n_examples, n_channels), dtype='float32')
+            ds_dtheta   = grp_attr.create_dataset('dtheta_deg', shape=(n_examples,), dtype='float32')
+            ds_r0       = grp_attr.create_dataset('r0', shape=(n_examples,), dtype='float32')
+            ds_regime   = grp_attr.create_dataset('regime', shape=(n_examples,), dtype=h5py.string_dtype(encoding='utf-8'))
+
+            # Backward compatibility attributes for legacy 2-plane readers
+            if len(nominal_distances) >= 2:
+                ds_dz1_nom = grp_attr.create_dataset('dz1_nominal', shape=(n_examples,), dtype='float32')
+                ds_dz2_nom = grp_attr.create_dataset('dz2_nominal', shape=(n_examples,), dtype='float32')
+                ds_asym    = grp_attr.create_dataset('dz_asymmetry', shape=(n_examples,), dtype='float32')
+                ds_dzi1    = grp_attr.create_dataset('dz_i1', shape=(n_examples,), dtype='float32')
+                ds_dzi2    = grp_attr.create_dataset('dz_i2', shape=(n_examples,), dtype='float32')
+                ds_dzii1   = grp_attr.create_dataset('dz_ii1', shape=(n_examples,), dtype='float32')
+                ds_dzii2   = grp_attr.create_dataset('dz_ii2', shape=(n_examples,), dtype='float32')
 
             t0 = time.time()
             last_time = time.time()
 
             for ex_idx in range(n_examples):
+                t_ex_start = time.time()
                 labels_ex = draw_coefficients(cfg, rng)
                 mirror_opd = sum(float(c) * m for c, m in zip(labels_ex, zernike_basis))
 
@@ -636,72 +765,76 @@ def main(
                 params = sample_tolerancing_parameters(cfg, rng, c4_factor)
                 atm_scale = (r0_ref / params['r0'])**(5.0 / 6.0)
 
-                # Channel 0: I_i1 (intra 1)
-                atm = reset_atm_seed(atm)
-                I_i1 = propagate_polychromatic(
-                    mirror_opd, +1.0, defocus_opd_unit, params['c4_i1'],
-                    cfg, aperture, prop, pupil_grid,
-                    wavelengths, weights, img_size,
-                    atm, atm_scale=atm_scale,
-                )
+                # Iterate through each defocus distance pair (intra, extra)
+                ch_idx = 0
+                for k in range(len(nominal_distances)):
+                    c4_intra = params['sampled_c4'][2 * k]
+                    c4_extra = params['sampled_c4'][2 * k + 1]
 
-                # Channel 1: I_i2 (extra 1, rotated 180° + dtheta)
-                atm = reset_atm_seed(atm)
-                I_i2_raw = propagate_polychromatic(
-                    mirror_opd, -1.0, defocus_opd_unit, params['c4_i2'],
-                    cfg, aperture, prop, pupil_grid,
-                    wavelengths, weights, img_size,
-                    atm, atm_scale=atm_scale,
-                )
-                I_i2 = _apply_rotation(I_i2_raw, params['dtheta_deg'])
+                    # Intra-focal channel: +c4
+                    atm = reset_atm_seed(atm)
+                    I_intra = propagate_polychromatic(
+                        mirror_opd, +1.0, defocus_opd_unit, c4_intra,
+                        cfg, aperture, prop, pupil_grid,
+                        wavelengths, weights, img_size,
+                        atm, atm_scale=atm_scale,
+                    )
+                    ds_psfs[ex_idx, ch_idx] = I_intra.astype(np.float16)
+                    ch_idx += 1
 
-                # Channel 2: I_ii1 (intra 2)
-                atm = reset_atm_seed(atm)
-                I_ii1 = propagate_polychromatic(
-                    mirror_opd, +1.0, defocus_opd_unit, params['c4_ii1'],
-                    cfg, aperture, prop, pupil_grid,
-                    wavelengths, weights, img_size,
-                    atm, atm_scale=atm_scale,
-                )
+                    # Extra-focal channel: -c4 (rotated 180° + dtheta)
+                    atm = reset_atm_seed(atm)
+                    I_extra_raw = propagate_polychromatic(
+                        mirror_opd, -1.0, defocus_opd_unit, c4_extra,
+                        cfg, aperture, prop, pupil_grid,
+                        wavelengths, weights, img_size,
+                        atm, atm_scale=atm_scale,
+                    )
+                    I_extra = _apply_rotation(I_extra_raw, params['dtheta_deg'])
+                    ds_psfs[ex_idx, ch_idx] = I_extra.astype(np.float16)
+                    ch_idx += 1
 
-                # Channel 3: I_ii2 (extra 2, rotated 180° + dtheta)
-                atm = reset_atm_seed(atm)
-                I_ii2_raw = propagate_polychromatic(
-                    mirror_opd, -1.0, defocus_opd_unit, params['c4_ii2'],
-                    cfg, aperture, prop, pupil_grid,
-                    wavelengths, weights, img_size,
-                    atm, atm_scale=atm_scale,
-                )
-                I_ii2 = _apply_rotation(I_ii2_raw, params['dtheta_deg'])
-
-                # Channel 4: I_focal (in-focus PSF, c4=0)
-                atm = reset_atm_seed(atm)
-                I_focal = propagate_polychromatic(
-                    mirror_opd, 0.0, defocus_opd_unit, 0.0,
-                    cfg, aperture, prop, pupil_grid,
-                    wavelengths, weights, img_size,
-                    atm, atm_scale=atm_scale,
-                )
-
-                # Store into HDF5
-                ds_psfs[ex_idx, 0] = I_i1.astype(np.float16)
-                ds_psfs[ex_idx, 1] = I_i2.astype(np.float16)
-                ds_psfs[ex_idx, 2] = I_ii1.astype(np.float16)
-                ds_psfs[ex_idx, 3] = I_ii2.astype(np.float16)
-                ds_psfs[ex_idx, 4] = I_focal.astype(np.float16)
+                # In-focus channel if included (c4 = 0.0)
+                if include_focal:
+                    atm = reset_atm_seed(atm)
+                    I_focal = propagate_polychromatic(
+                        mirror_opd, 0.0, defocus_opd_unit, 0.0,
+                        cfg, aperture, prop, pupil_grid,
+                        wavelengths, weights, img_size,
+                        atm, atm_scale=atm_scale,
+                    )
+                    ds_psfs[ex_idx, ch_idx] = I_focal.astype(np.float16)
+                    ch_idx += 1
 
                 ds_labels[ex_idx] = labels_ex.astype(np.float32)
 
-                ds_dz1_nom[ex_idx] = params['dz1_nominal']
-                ds_dz2_nom[ex_idx] = params['dz2_nominal']
-                ds_asym[ex_idx]    = params['dz_asymmetry']
+                ds_samp_dz[ex_idx] = params['sampled_dz']
+                ds_samp_c4[ex_idx] = params['sampled_c4']
                 ds_dtheta[ex_idx]  = params['dtheta_deg']
                 ds_r0[ex_idx]      = params['r0']
-                ds_dzi1[ex_idx]    = params['dz_i1']
-                ds_dzi2[ex_idx]    = params['dz_i2']
-                ds_dzii1[ex_idx]   = params['dz_ii1']
-                ds_dzii2[ex_idx]   = params['dz_ii2']
                 ds_regime[ex_idx]  = params['regime']
+
+                if len(nominal_distances) >= 2:
+                    ds_dz1_nom[ex_idx] = params['dz1_nominal']
+                    ds_dz2_nom[ex_idx] = params['dz2_nominal']
+                    ds_asym[ex_idx]    = params['dz_asymmetry']
+                    ds_dzi1[ex_idx]    = params['dz_i1']
+                    ds_dzi2[ex_idx]    = params['dz_i2']
+                    ds_dzii1[ex_idx]   = params['dz_ii1']
+                    ds_dzii2[ex_idx]   = params['dz_ii2']
+
+                ex_time = time.time() - t_ex_start
+
+                if output_tmp_plots:
+                    save_verification_plot(
+                        psfs_frame0=ds_psfs[ex_idx, :, 0],
+                        channel_names=channel_names,
+                        metric_tags=metric_tags,
+                        ex_idx=ex_idx,
+                        n_examples=n_examples,
+                        ex_time=ex_time,
+                        out_path=tmp_plot_path,
+                    )
 
                 if (ex_idx + 1) % 5 == 0 or ex_idx == n_examples - 1:
                     elapsed = time.time() - t0
@@ -775,6 +908,10 @@ if __name__ == '__main__':
                         help='Directory for sparse HPC logs.')
     parser.add_argument('--no_sparse_record', action='store_true',
                         help='Disable sparse HPC logging.')
+    parser.add_argument('--output_tmp_plots', action='store_true', default=None,
+                        help='Save verification plot PNG at the conclusion of each example.')
+    parser.add_argument('--tmp_plot_path', default=None,
+                        help='Override path for temporary verification plot PNG.')
 
     args, overrides = parser.parse_known_args()
     cfg = load_config(args.config)
@@ -786,6 +923,10 @@ if __name__ == '__main__':
         cfg.sparse_dir = args.sparse_dir
     if args.no_sparse_record:
         cfg.no_sparse_record = True
+    if args.output_tmp_plots is not None:
+        cfg.simulation.output_tmp_plots = args.output_tmp_plots
+    if args.tmp_plot_path is not None:
+        cfg.simulation.tmp_plot_path = args.tmp_plot_path
 
     main(
         cfg=cfg,

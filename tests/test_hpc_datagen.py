@@ -104,7 +104,7 @@ class TestHPCDataGen(unittest.TestCase):
         staging = Path(self.mock_cfg["storage"]["staging_dir"])
         target = Path(self.mock_cfg["storage"]["target_root"]) / self.mock_cfg["storage"]["sub_dir"]
         self.assertNotEqual(staging, target)
-        self.assertTrue(str(target).endswith("rental/shards"))
+        self.assertTrue(target.as_posix().endswith("rental/shards"))
 
 
 if __name__ == "__main__":

@@ -7,24 +7,30 @@ optics:
   ID: 0.152              # inner aperture diameter (central obscuration), metres
   focal_ratio: 3.33      # f-number (focal length = OD * focal_ratio)
 
-  # Defocus distances: physical axial offsets of cameras from nominal focus.
-  # Sign convention: I1 = intra-focal (+delta_z), I2 = extra-focal (-delta_z).
-  # delta_z drives c4 = delta_z / (16 * focal_ratio^2 * sqrt(3))  [metres OPD]
-  delta_z1: 0.369e-3       # Channel I axial defocus distance per camera, metres (nominal)
-  delta_z: 0.369e-3        # Alias for delta_z1 (backward compatibility)
-  delta_z2: 0.738e-3       # Channel II axial defocus distance per camera, metres (nominal, 2x dz1)
+  # Modular Defocus Specification:
+  # Physical axial offsets of camera measurement planes from nominal focus, in metres.
+  # For each distance d_k:
+  #   Channel 2k   : Intra-focal (+d_k)
+  #   Channel 2k+1 : Extra-focal (-d_k, rotated 180° + dtheta)
+  # If include_focal is true, the nominal focal plane (dz=0) is appended as Channel 2K.
+  defocus_distances_m:
+    - 0.369e-3
+    - 0.738e-3
+    - 1.107e-3
+    - 1.476e-3
+    - 1.845e-3
+  include_focal: true
+
+  # Legacy aliases for backward compatibility
+  delta_z: 0.369e-3
 
   # Focal plane sampling.
   # q   : pixels per lambda/D at the reference wavelength.
-  #       Must satisfy q >= 2 (Nyquist); q=4 is the practical minimum for
-  #       defocused PSFs; q=8 is conservative. q need not be an integer.
-  # num_airy : half-width of focal grid in lambda/D units. The defocused PSF
-  #            blur radius ~ delta_z / (8*(f/#)^2 * lambda/D) in lambda/D.
-  #            Set large enough that < 1% of broadband flux is clipped at
-  #            the longest wavelength. Verify empirically with check_grid_extent.
-  # Currently: match with 4x oversampled pixels on LFAST ZWO ASI183 cam
+  # num_airy : half-width of focal grid in lambda/D units.
+  #            num_airy=170 yields 1028x1028 subpixels, covering the 1024x1024
+  #            detector window and allowing zero-copy slicing without zero-padding.
   q: 3.025
-  num_airy: 138
+  num_airy: 170
 
   # Sub-pixel oversampling factor. The focal grid is sampled at
   # (img_size * pixel_oversample)^2 and binned to img_size^2 after
@@ -32,7 +38,8 @@ optics:
   pixel_oversample: 4
 
   # Pupil grid resolution (samples across diameter).
-  pupil_samples: 256
+  # Np=512 satisfies Nyquist sampling up to dz=1.885 mm at 380 nm.
+  pupil_samples: 512
 
   # Reference wavelength used to anchor the lambda/D grid and as the
   # base wavelength for atmospheric OPD extraction.
@@ -90,23 +97,11 @@ atmosphere:
 
 tolerancing:
   # Physical optomechanical and seeing variations sampled per example
-  enabled: true
+  enabled: false
 
-  # Defocus distances: uniform distribution ±10% around nominal
-  dz1:
-    distribution: "uniform"
-    nominal: 0.369e-3       # metres (369 um)
-    range_pct: 0.10         # ±10% -> [0.3321, 0.4059] mm
-  dz2:
-    distribution: "uniform"
-    nominal: 0.738e-3       # metres (738 um)
-    range_pct: 0.10         # ±10% -> [0.6642, 0.8118] mm
-
-  # Axial asymmetry between intra and extra focal cameras (shared zero-point offset)
-  # dz_i1 = dz1 + asymmetry/2, dz_i2 = dz1 - asymmetry/2
-  asymmetry:
-    distribution: "uniform"
-    max_m: 40.0e-6          # ±40 um -> [-40 um, +40 um]
+  # Absolute axial positioning uncertainty per defocus plane, in metres.
+  # Uniform distribution in [-dz_uncertainty_m, +dz_uncertainty_m] (e.g. ±40 um)
+  dz_uncertainty_m: 40.0e-6
 
   # Camera rotational clocking error around nominal 180° Roddier flip
   dtheta:
@@ -120,8 +115,8 @@ tolerancing:
     r0_max: 0.16            # metres (16 cm)
 
 simulation:
-  n_examples: 1000       # default examples per run/shard (overridden by CLI or array task)
-  n_channels: 5          # 5 channels: [Ii1, Ii2, Iii1, Iii2, focal]
+  n_examples: 10       # default examples per run/shard (overridden by CLI or array task)
+  n_channels: 11         # 11 channels: 5 intra/extra pairs + focal plane [0.369, 0.738, 1.107, 1.476, 1.845]mm
   t_frames: 8            # frames per sequence pair
   frame_rate: 50.0       # Hz
 
@@ -130,6 +125,9 @@ simulation:
 
   # HDF5 chunk shape along the N axis (1 enables sub-millisecond per-example streaming).
   hdf5_chunk_size: 1
+
+  # Save debug/verification PNG plot at conclusion of each example (overwritten each example)
+  output_tmp_plots: false
 
   random_seed: 42
 
